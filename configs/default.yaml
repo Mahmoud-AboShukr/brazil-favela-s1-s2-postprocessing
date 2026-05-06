@@ -2,18 +2,13 @@ input_root: /media/HALLOPEAU/T7/my_processed_data
 output_root: /media/HALLOPEAU/T7/post_processing_dataset
 
 s2_root: /media/HALLOPEAU/T7/my_processed_data/s2_images
-s1_root: /media/HALLOPEAU/T7/my_processed_data/s1_images/rtc_aligned
+s1_root: /media/HALLOPEAU/T7/my_processed_data/s1_images/raw
 
-# Main final label source
 final_label_vector: /media/HALLOPEAU/T7/my_processed_data/polygons/final_pipeline_scale_up/brazil_refined_dissolved.gpkg
-
-# Optional auxiliary original polygon source
 original_polygon_vector: /media/HALLOPEAU/T7/my_processed_data/polygons/polygons_clean/favelas_clean.gpkg
 
-# Hard-city OCM composites, if needed later
-ocm_composites_root: /media/HALLOPEAU/T7/ocm_v1_outputs/composites
-
 keep_all_s2_bands: true
+s1_product_type: GRD
 s1_create_vv_minus_vh: true
 s1_db_mode: auto
 
