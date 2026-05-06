@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Large geospatial / ML data
+*.tif
+*.tiff
+*.jp2
+*.h5
+*.hdf5
+*.nc
+*.zarr
+*.gpkg
+*.shp
+*.dbf
+*.shx
+*.cpg
+*.prj
+*.zip
+*.SAFE/
+
+# Outputs
+outputs/
+data/
+reports/*.png
+reports/*.tif
+
+# QGIS / GDAL sidecars
+*.aux.xml
+*.ovr
+*.xml
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

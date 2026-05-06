@@ -1,0 +1,8 @@
+rasterio
+geopandas
+shapely
+numpy
+pandas
+pyyaml
+tqdm
+h5py
