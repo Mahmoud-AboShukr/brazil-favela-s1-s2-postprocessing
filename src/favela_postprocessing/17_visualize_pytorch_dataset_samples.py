@@ -16,7 +16,7 @@ It does NOT duplicate the dataset.
 
 For each selected patch, it visualizes:
     - Sentinel-2 RGB preview: B04/B03/B02
-    - Sentinel-2 false color preview: B08/B04/B03
+    - Sentinel-2 false-color preview: B08/B04/B03
     - Sentinel-1 VV_dB
     - Sentinel-1 VH_dB
     - Sentinel-1 VV_minus_VH_dB
@@ -24,27 +24,21 @@ For each selected patch, it visualizes:
     - label overlay on S2 RGB
     - valid mask
 
-Default input
--------------
-Patch list:
-
-    <output_root>/metadata/patch_filter_sets_train_covered_region_test_ps512_st512_cover/
-        filter_set_F02_quality_pass.csv
-
-Normalization:
-
-    By default, visualization uses normalization='none' so the displayed values are closer
-    to the original reflectance/dB ranges.
+Important visualization fix
+---------------------------
+Binary panels such as label mask and valid mask are displayed with fixed
+vmin=0 and vmax=1. Without this, matplotlib can render constant masks
+misleadingly.
 
 Examples
 --------
-Visualize mixed positive/negative training patches:
+Visualize mixed test patches:
 
     python3 src/favela_postprocessing/17_visualize_pytorch_dataset_samples.py \
         --config configs/default.yaml \
-        --split train \
+        --split test \
         --sample-mode mixed \
-        --num-samples 12
+        --num-samples 8
 
 Visualize positive validation patches:
 
@@ -52,14 +46,6 @@ Visualize positive validation patches:
         --config configs/default.yaml \
         --split val \
         --sample-mode positive \
-        --num-samples 8
-
-Visualize test patches:
-
-    python3 src/favela_postprocessing/17_visualize_pytorch_dataset_samples.py \
-        --config configs/default.yaml \
-        --split test \
-        --sample-mode random \
         --num-samples 8
 """
 
@@ -72,13 +58,14 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import yaml
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 
 SCRIPT_NAME = "17_visualize_pytorch_dataset_samples.py"
@@ -231,6 +218,7 @@ def default_filter_set_path(
     filter_set_id: str,
 ) -> Path:
     suffix = default_suffix(split_strategy, patch_size, stride, edge_mode)
+
     return (
         output_root
         / "metadata"
@@ -248,6 +236,7 @@ def default_normalization_json_path(
     filter_set_id: str,
 ) -> Path:
     suffix = default_suffix(split_strategy, patch_size, stride, edge_mode)
+
     return output_root / "metadata" / f"normalization_stats_{suffix}_{filter_set_id}.json"
 
 
@@ -262,6 +251,7 @@ def default_output_dir(
     sample_mode: str,
 ) -> Path:
     suffix = default_suffix(split_strategy, patch_size, stride, edge_mode)
+
     return (
         output_root
         / "qc"
@@ -302,10 +292,16 @@ def load_dataset_module():
 def bool_from_any(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"true", "1", "yes", "y"}
+
     return bool(value)
 
 
-def select_indices(df: pd.DataFrame, mode: str, num_samples: int, seed: int) -> List[int]:
+def select_indices(
+    df: pd.DataFrame,
+    mode: str,
+    num_samples: int,
+    seed: int,
+) -> List[int]:
     if num_samples <= 0:
         raise ValueError(f"num_samples must be positive, got {num_samples}")
 
@@ -357,7 +353,9 @@ def select_indices(df: pd.DataFrame, mode: str, num_samples: int, seed: int) -> 
             selected.extend(rng.choice(neg_indices, size=n_neg, replace=False).tolist())
 
         if len(selected) < num_samples:
-            remaining = np.array([idx for idx in all_indices if idx not in set(selected)])
+            selected_set = set(selected)
+            remaining = np.array([idx for idx in all_indices if idx not in selected_set])
+
             if len(remaining) > 0:
                 n_extra = min(num_samples - len(selected), len(remaining))
                 selected.extend(rng.choice(remaining, size=n_extra, replace=False).tolist())
@@ -370,14 +368,15 @@ def select_indices(df: pd.DataFrame, mode: str, num_samples: int, seed: int) -> 
 def tensor_to_numpy(value: Any) -> np.ndarray:
     if hasattr(value, "detach"):
         return value.detach().cpu().numpy()
+
     return np.asarray(value)
 
 
 def robust_stretch(
     arr: np.ndarray,
     valid_mask: Optional[np.ndarray] = None,
-    p_low: float = 2,
-    p_high: float = 98,
+    p_low: float = 2.0,
+    p_high: float = 98.0,
 ) -> np.ndarray:
     """
     Stretch array to [0, 1] using robust percentiles.
@@ -419,22 +418,25 @@ def make_rgb(
     """
     Make RGB display from S2 array [C, H, W].
 
-    bands are zero-based indices.
+    Bands are zero-based indices:
+        B04/B03/B02 = [3, 2, 1]
+        B08/B04/B03 = [7, 3, 2]
     """
-    rgb_channels = []
+    channels = []
 
     for band_idx in bands:
-        rgb_channels.append(
-            robust_stretch(s2[band_idx], valid_mask=valid_mask)
-        )
+        channels.append(robust_stretch(s2[band_idx], valid_mask=valid_mask))
 
-    rgb = np.stack(rgb_channels, axis=-1)
-    return rgb
+    return np.stack(channels, axis=-1)
 
 
-def make_overlay(rgb: np.ndarray, label: np.ndarray, alpha: float = 0.45) -> np.ndarray:
+def make_filled_label_overlay(
+    rgb: np.ndarray,
+    label: np.ndarray,
+    alpha: float = 0.45,
+) -> np.ndarray:
     """
-    Overlay binary label mask on RGB in red.
+    Overlay binary label mask on RGB using red fill.
     """
     overlay = rgb.copy()
     mask = label > 0.5
@@ -453,9 +455,30 @@ def add_panel(
     image: np.ndarray,
     title: str,
     cmap: Optional[str] = None,
+    binary: bool = False,
+    contour: Optional[np.ndarray] = None,
 ) -> None:
+    """
+    Add one image panel.
+
+    binary=True forces fixed vmin/vmax so constant masks display correctly.
+    contour is used to draw label boundaries over RGB/overlay panels.
+    """
     ax = axes[panel_idx]
-    ax.imshow(image, cmap=cmap)
+
+    if binary:
+        ax.imshow(image, cmap=cmap, vmin=0, vmax=1)
+    else:
+        ax.imshow(image, cmap=cmap)
+
+    if contour is not None and np.any(contour > 0.5):
+        ax.contour(
+            contour,
+            levels=[0.5],
+            colors=["yellow"],
+            linewidths=0.8,
+        )
+
     ax.set_title(title, fontsize=9)
     ax.axis("off")
 
@@ -465,6 +488,23 @@ def safe_float(value: Any, default: float = math.nan) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def safe_filename(text: str, max_len: int = 150) -> str:
+    keep = []
+
+    for char in text:
+        if char.isalnum() or char in {"_", "-", "."}:
+            keep.append(char)
+        else:
+            keep.append("_")
+
+    name = "".join(keep)
+
+    if len(name) > max_len:
+        name = name[:max_len]
+
+    return name
 
 
 def visualize_sample(
@@ -486,61 +526,106 @@ def visualize_sample(
         s2 = tensor_to_numpy(sample["s2"])
 
         if s2.shape[0] >= 8:
-            rgb = make_rgb(s2, bands=[3, 2, 1], valid_mask=valid)  # B04, B03, B02
-            false_color = make_rgb(s2, bands=[7, 3, 2], valid_mask=valid)  # B08, B04, B03
+            rgb = make_rgb(s2, bands=[3, 2, 1], valid_mask=valid)
+            false_color = make_rgb(s2, bands=[7, 3, 2], valid_mask=valid)
 
-            panels.append({"image": rgb, "title": "S2 RGB B04/B03/B02", "cmap": None})
-            panels.append({"image": false_color, "title": "S2 False Color B08/B04/B03", "cmap": None})
+            panels.append(
+                {
+                    "image": rgb,
+                    "title": "S2 RGB B04/B03/B02",
+                    "cmap": None,
+                    "binary": False,
+                    "contour": None,
+                }
+            )
+            panels.append(
+                {
+                    "image": false_color,
+                    "title": "S2 False Color B08/B04/B03",
+                    "cmap": None,
+                    "binary": False,
+                    "contour": None,
+                }
+            )
         else:
-            panels.append({
-                "image": robust_stretch(s2[0], valid_mask=valid),
-                "title": "S2 band 1",
-                "cmap": "gray",
-            })
+            panels.append(
+                {
+                    "image": robust_stretch(s2[0], valid_mask=valid),
+                    "title": "S2 band 1",
+                    "cmap": "gray",
+                    "binary": False,
+                    "contour": None,
+                }
+            )
 
     if "s1" in sample:
         s1 = tensor_to_numpy(sample["s1"])
 
         if s1.shape[0] >= 1:
-            panels.append({
-                "image": robust_stretch(s1[0], valid_mask=valid),
-                "title": "S1 VV_dB",
-                "cmap": "gray",
-            })
+            panels.append(
+                {
+                    "image": robust_stretch(s1[0], valid_mask=valid),
+                    "title": "S1 VV_dB",
+                    "cmap": "gray",
+                    "binary": False,
+                    "contour": None,
+                }
+            )
 
         if s1.shape[0] >= 2:
-            panels.append({
-                "image": robust_stretch(s1[1], valid_mask=valid),
-                "title": "S1 VH_dB",
-                "cmap": "gray",
-            })
+            panels.append(
+                {
+                    "image": robust_stretch(s1[1], valid_mask=valid),
+                    "title": "S1 VH_dB",
+                    "cmap": "gray",
+                    "binary": False,
+                    "contour": None,
+                }
+            )
 
         if s1.shape[0] >= 3:
-            panels.append({
-                "image": robust_stretch(s1[2], valid_mask=valid),
-                "title": "S1 VV-minus-VH_dB",
-                "cmap": "gray",
-            })
+            panels.append(
+                {
+                    "image": robust_stretch(s1[2], valid_mask=valid),
+                    "title": "S1 VV-minus-VH_dB",
+                    "cmap": "gray",
+                    "binary": False,
+                    "contour": None,
+                }
+            )
 
-    panels.append({
-        "image": label,
-        "title": "Label mask",
-        "cmap": "gray",
-    })
+    panels.append(
+        {
+            "image": label,
+            "title": "Label mask",
+            "cmap": "gray",
+            "binary": True,
+            "contour": None,
+        }
+    )
 
     if rgb is not None:
-        overlay = make_overlay(rgb, label)
-        panels.append({
-            "image": overlay,
-            "title": "Label overlay on S2 RGB",
-            "cmap": None,
-        })
+        overlay = make_filled_label_overlay(rgb, label)
 
-    panels.append({
-        "image": valid.astype("float32"),
-        "title": "Valid mask",
-        "cmap": "gray",
-    })
+        panels.append(
+            {
+                "image": overlay,
+                "title": "Label overlay on S2 RGB",
+                "cmap": None,
+                "binary": False,
+                "contour": label,
+            }
+        )
+
+    panels.append(
+        {
+            "image": valid.astype("float32"),
+            "title": "Valid mask",
+            "cmap": "gray",
+            "binary": True,
+            "contour": None,
+        }
+    )
 
     n_panels = len(panels)
     ncols = 3
@@ -562,6 +647,8 @@ def visualize_sample(
             image=panel["image"],
             title=panel["title"],
             cmap=panel["cmap"],
+            binary=bool(panel["binary"]),
+            contour=panel["contour"],
         )
 
     for j in range(n_panels, len(axes)):
@@ -598,23 +685,6 @@ def visualize_sample(
         "valid_percent": valid_percent,
         "output_path": str(output_path),
     }
-
-
-def safe_filename(text: str, max_len: int = 120) -> str:
-    keep = []
-
-    for char in text:
-        if char.isalnum() or char in {"_", "-", "."}:
-            keep.append(char)
-        else:
-            keep.append("_")
-
-    name = "".join(keep)
-
-    if len(name) > max_len:
-        name = name[:max_len]
-
-    return name
 
 
 def main() -> int:
@@ -708,7 +778,6 @@ def main() -> int:
     for output_i, dataset_idx in enumerate(selected_indices):
         sample = dataset[dataset_idx]
 
-        patch_id = str(sample["patch_id"])
         city = str(sample["city"])
         split = str(sample["split"])
         pos_percent = safe_float(sample.get("label_positive_percent", math.nan))
