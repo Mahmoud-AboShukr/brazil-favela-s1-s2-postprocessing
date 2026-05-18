@@ -401,22 +401,32 @@ def query_product_by_name(
     catalogue_url: str,
     timeout: int,
 ) -> dict:
+    """
+    Query Copernicus Data Space OData by product name.
+
+    Important:
+    We intentionally do not use $expand here. The base Products response already
+    contains the fields needed for download: Id, Name, Online, ContentDate, etc.
+    Some CDSE deployments reject comma-style $expand values such as
+    Attributes,Locations.
+    """
+    session = requests.Session()
+
     # Exact query first.
     filter_expr = f"Name eq {odata_string_literal(product_name)}"
-    encoded_filter = quote(filter_expr, safe="()' =")
 
-    url = (
-        f"{catalogue_url}/Products?"
-        f"$filter={encoded_filter}"
-        f"&$expand=Attributes,Locations"
-    )
+    url = f"{catalogue_url}/Products"
+    params = {
+        "$filter": filter_expr,
+        "$top": "10",
+    }
 
-    response = requests.get(url, timeout=timeout)
+    response = session.get(url, params=params, timeout=timeout)
 
     if response.status_code != 200:
         raise RuntimeError(
-            f"Copernicus OData query failed. HTTP {response.status_code}: "
-            f"{response.text[:1000]}"
+            f"Copernicus OData exact-name query failed. HTTP {response.status_code}: "
+            f"{response.text[:1000]} | URL={response.url}"
         )
 
     data = response.json()
@@ -424,34 +434,33 @@ def query_product_by_name(
 
     if values:
         return {
-            "query_type": "exact_name",
-            "query_url": url,
+            "query_type": "exact_name_no_expand",
+            "query_url": response.url,
             "matches": values,
         }
 
-    # Fallback contains query, useful if product is named with .zip or slightly different suffix.
+    # Fallback contains query.
     base = product_name.replace(".SAFE", "")
     filter_expr = f"contains(Name,{odata_string_literal(base)})"
-    encoded_filter = quote(filter_expr, safe="()' ,=")
 
-    url = (
-        f"{catalogue_url}/Products?"
-        f"$filter={encoded_filter}"
-        f"&$expand=Attributes,Locations"
-    )
+    params = {
+        "$filter": filter_expr,
+        "$top": "20",
+    }
 
-    response = requests.get(url, timeout=timeout)
+    response = session.get(url, params=params, timeout=timeout)
 
     if response.status_code != 200:
         raise RuntimeError(
-            f"Copernicus fallback OData query failed. HTTP {response.status_code}: "
-            f"{response.text[:1000]}"
+            f"Copernicus OData contains-name query failed. HTTP {response.status_code}: "
+            f"{response.text[:1000]} | URL={response.url}"
         )
 
     data = response.json()
+
     return {
-        "query_type": "contains_name",
-        "query_url": url,
+        "query_type": "contains_name_no_expand",
+        "query_url": response.url,
         "matches": data.get("value", []),
     }
 
