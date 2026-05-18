@@ -1,0 +1,10 @@
+output_root: "D:/post_processing_dataset"
+instance_root: "D:/post_processing_dataset/dataset_instances/instance_C_s2_nodata_repaired"
+
+s2_root: "D:/post_processing_dataset/dataset_instances/instance_C_s2_nodata_repaired/s2_filled"
+s1_ready_root: "D:/post_processing_dataset/dataset_instances/instance_C_s2_nodata_repaired/s1_ready"
+s1_grd_root: "D:/post_processing_dataset/s1_final"   # or old direct-GRD location, verify
+label_root: "D:/post_processing_dataset/dataset_instances/instance_C_s2_nodata_repaired/labels"
+
+metadata_root: "D:/post_processing_dataset/dataset_instances/instance_C_s2_nodata_repaired/metadata"
+experiments_root: "D:/post_processing_dataset/dataset_instances/instance_C_s2_nodata_repaired/experiments"
