@@ -254,8 +254,14 @@ def write_markdown(
 # ---------------------------------------------------------------------
 
 def affine_to_tuple(transform: Affine) -> Tuple[float, float, float, float, float, float]:
-    return tuple(float(x) for x in transform)
-
+    return (
+        float(transform.a),
+        float(transform.b),
+        float(transform.c),
+        float(transform.d),
+        float(transform.e),
+        float(transform.f),
+    )
 
 def is_identity_like_transform(transform: Affine, tolerance: float = 1e-9) -> bool:
     """
