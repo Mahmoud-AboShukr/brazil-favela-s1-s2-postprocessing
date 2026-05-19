@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+venv311/
+venv312/
 .env
 
 # Large geospatial / ML data
