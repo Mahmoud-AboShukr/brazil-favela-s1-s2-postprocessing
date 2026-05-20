@@ -4,29 +4,41 @@
 """
 01_build_patch_tiling_index_224.py
 
-Build a 224x224 overlapping patch tiling index for the repaired instance C dataset.
+Build the 224x224 patch tiling index for Instance C.
 
-This script DOES NOT export physical patch images.
-It only creates a metadata index so downstream dataloaders can read GeoTIFF windows directly.
+This script validates and indexes the aligned Instance C raster stack:
 
-Expected instance structure:
+    S2 filled:
+        <instance-root>/s2_filled/<city>/<city>_s2_*.tif
+        Expected bands: 12
 
-instance_C_s2_nodata_repaired/
-    s2_filled/<city>/<city>_s2_12bands_reflectance_10m.tif
-    s1_ready/<city>/<city>_s1_ready_vv_vh_vvdiff_10m_aligned.tif
-    labels/<city>/<city>_label_final.tif
-    s1_rtc_ready/<city>/<city>_s1_rtc_vv_vh_vvdiff_10m_aligned.tif  # optional / future
+    S1 SNAP-GRD:
+        <instance-root>/s1_ready/<city>/<city>_s1_*.tif
+        Expected bands: 3
+        Convention: VV, VH, VV_minus_VH
 
-Default output:
+    S1 RTC:
+        <instance-root>/s1_rtc_ready/<city>/<city>_s1_rtc_vv_vh_10m_aligned.tif
+        Expected bands: 2
+        Convention: VV, VH
 
-instance_C_s2_nodata_repaired/
-    metadata/
-        instance_C_patches/
-            patch_tiling_index_ps224_st112_cover.csv
-            patch_tiling_index_ps224_st112_cover.json
-            patch_tiling_index_ps224_st112_cover.md
+    Labels:
+        <instance-root>/labels/<city>/<city>_label_final.tif
+        Expected bands: 1
 
-Example PowerShell command:
+Important:
+    RTC is intentionally 2 bands only.
+    Do NOT expect VV_minus_VH for RTC.
+    This is required for CROMA-compatible SAR input [2, 224, 224].
+
+Outputs:
+
+    <instance-root>/metadata/instance_C_patches/
+        patch_tiling_index_ps224_st112_cover.csv
+        patch_tiling_index_ps224_st112_cover.json
+        patch_tiling_index_ps224_st112_cover.md
+
+Example:
 
 python src/instance_C/01_build_patch_tiling_index_224.py `
   --instance-root "D:/post_processing_dataset/dataset_instances/instance_C_s2_nodata_repaired" `
@@ -41,75 +53,25 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import sys
-from collections import Counter
+import math
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 try:
     import rasterio
 except ImportError as exc:
     raise SystemExit(
-        "[ERROR] rasterio is required but is not installed in this environment.\n"
-        "Install it first, for example:\n"
+        "[ERROR] rasterio is required.\n"
+        "Install it with:\n"
         "    pip install rasterio\n\n"
-        f"Original import error: {exc}"
+        f"Original error: {exc}"
     )
 
 
 # ---------------------------------------------------------------------
-# Fallback city-region mapping
-# ---------------------------------------------------------------------
-
-FALLBACK_CITY_TO_REGION: Dict[str, str] = {
-    "belem": "North",
-    "manaus": "North",
-
-    "fortaleza": "Northeast",
-    "joao_pessoa": "Northeast",
-    "maceio": "Northeast",
-    "natal": "Northeast",
-    "recife": "Northeast",
-    "salvador": "Northeast",
-    "sao_luis": "Northeast",
-    "teresina": "Northeast",
-
-    "brasilia": "Central-West",
-    "campo_grande": "Central-West",
-    "goiania": "Central-West",
-
-    "belo_horizonte": "Southeast",
-    "campinas": "Southeast",
-    "duque_de_caxias": "Southeast",
-    "guarulhos": "Southeast",
-    "nova_iguacu": "Southeast",
-    "rio_de_janeiro": "Southeast",
-    "santo_andre": "Southeast",
-    "sao_bernardo_do_campo": "Southeast",
-    "sao_goncalo": "Southeast",
-    "sao_paulo": "Southeast",
-    "sorocaba": "Southeast",
-
-    "curitiba": "South",
-    "porto_alegre": "South",
-}
-
-
-QA_NAME_PARTS = (
-    "valid_mask",
-    "fill_level",
-    "fill_source",
-    "nodata",
-    "qa",
-    "mask_before",
-    "mask_after",
-    "summary",
-)
-
-
-# ---------------------------------------------------------------------
-# Logging and utility helpers
+# Logging
 # ---------------------------------------------------------------------
 
 def log(level: str, message: str) -> None:
@@ -127,8 +89,13 @@ def path_to_str(path: Optional[Path]) -> str:
     return str(path).replace("\\", "/")
 
 
-def normalize_city_name(value: str) -> str:
-    return value.strip().replace("\\", "/").split("/")[-1]
+def normalize_city(value: str) -> str:
+    value = str(value).strip()
+    value = value.replace("\\", "/").split("/")[-1]
+    value = value.lower().replace("-", "_").replace(" ", "_")
+    value = re.sub(r"[^a-z0-9_]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value
 
 
 def ensure_output_can_be_written(path: Path, overwrite: bool) -> None:
@@ -140,491 +107,24 @@ def ensure_output_can_be_written(path: Path, overwrite: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def is_probably_qa_file(path: Path) -> bool:
-    lower_name = path.name.lower()
-    return any(part in lower_name for part in QA_NAME_PARTS)
-
-
-def filter_non_qa_tifs(paths: Iterable[Path]) -> List[Path]:
-    clean_paths = []
-
-    for path in paths:
-        if path.suffix.lower() not in {".tif", ".tiff"}:
-            continue
-
-        if is_probably_qa_file(path):
-            continue
-
-        clean_paths.append(path)
-
-    return sorted(set(clean_paths))
-
-
 # ---------------------------------------------------------------------
-# City discovery and region metadata
+# CSV / JSON / Markdown I/O
 # ---------------------------------------------------------------------
 
-def discover_cities_from_s2(s2_root: Path) -> List[str]:
-    """
-    Discover cities from s2_filled/.
+def read_csv_rows_optional(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        return []
 
-    Expected structure:
-        s2_filled/<city>/<city>_s2_12bands_reflectance_10m.tif
-    """
-
-    if not s2_root.exists():
-        fail(f"S2 root does not exist: {path_to_str(s2_root)}")
-
-    city_dirs = [
-        child.name
-        for child in sorted(s2_root.iterdir())
-        if child.is_dir()
-    ]
-
-    if not city_dirs:
-        fail(
-            "No city folders were found under s2_filled/:\n"
-            f"  {path_to_str(s2_root)}"
-        )
-
-    return [normalize_city_name(city) for city in city_dirs]
-
-
-def find_city_region_table(instance_root: Path, explicit_table: Optional[Path]) -> Optional[Path]:
-    if explicit_table is not None:
-        if explicit_table.exists():
-            return explicit_table
-        fail(f"Explicit --city-region-table does not exist: {path_to_str(explicit_table)}")
-
-    candidates = [
-        instance_root / "metadata" / "city_region_table.csv",
-        instance_root / "city_region_table.csv",
-        instance_root.parent / "metadata" / "city_region_table.csv",
-        instance_root.parent.parent / "metadata" / "city_region_table.csv",
-    ]
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    return None
-
-
-def load_city_region_mapping(
-    instance_root: Path,
-    explicit_table: Optional[Path],
-) -> Tuple[Dict[str, str], Optional[Path]]:
-    """
-    Load city-region mapping.
-
-    If a city_region_table.csv exists, use it.
-    Otherwise, use the built-in 26-city fallback mapping.
-    """
-
-    table_path = find_city_region_table(instance_root, explicit_table)
-
-    mapping: Dict[str, str] = {}
-
-    if table_path is None:
-        log(
-            "WARN",
-            "No city_region_table.csv found. Using built-in fallback city-region mapping.",
-        )
-        mapping.update(FALLBACK_CITY_TO_REGION)
-        return mapping, None
-
-    log("INFO", f"Loading city-region table: {path_to_str(table_path)}")
-
-    with table_path.open("r", encoding="utf-8-sig", newline="") as f:
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
+        return list(reader)
 
-        if not reader.fieldnames:
-            fail(f"City-region table has no header: {path_to_str(table_path)}")
-
-        lower_to_original = {
-            col.lower().strip(): col
-            for col in reader.fieldnames
-        }
-
-        city_col = None
-        for candidate in ("city", "city_slug", "city_name", "name"):
-            if candidate in lower_to_original:
-                city_col = lower_to_original[candidate]
-                break
-
-        region_col = None
-        for candidate in ("region", "macroregion", "brazil_region", "geographic_region"):
-            if candidate in lower_to_original:
-                region_col = lower_to_original[candidate]
-                break
-
-        if city_col is None or region_col is None:
-            fail(
-                "Could not identify city and region columns in city-region table.\n"
-                f"Table: {path_to_str(table_path)}\n"
-                f"Columns found: {reader.fieldnames}\n"
-                "Expected a city column like 'city' or 'city_slug', and a region column like 'region'."
-            )
-
-        for row in reader:
-            city = normalize_city_name(str(row.get(city_col, "")))
-            region = str(row.get(region_col, "")).strip()
-
-            if city and region:
-                mapping[city] = region
-
-    # Supplement any missing city from the fallback mapping without overwriting the CSV.
-    for city, region in FALLBACK_CITY_TO_REGION.items():
-        mapping.setdefault(city, region)
-
-    return mapping, table_path
-
-
-# ---------------------------------------------------------------------
-# Raster discovery
-# ---------------------------------------------------------------------
-
-def find_one_raster(
-    folder: Path,
-    patterns: Sequence[str],
-    label: str,
-    allow_missing: bool = False,
-) -> Optional[Path]:
-    """
-    Find exactly one non-QA raster using ordered glob patterns.
-
-    The strictest patterns should be first.
-    If a broad pattern matches multiple files, we fail rather than choosing silently.
-    """
-
-    if not folder.exists():
-        if allow_missing:
-            return None
-        fail(f"Missing {label} folder: {path_to_str(folder)}")
-
-    for pattern in patterns:
-        matches = filter_non_qa_tifs(folder.glob(pattern))
-
-        if len(matches) == 1:
-            return matches[0]
-
-        if len(matches) > 1:
-            formatted = "\n".join(f"    - {path_to_str(p)}" for p in matches[:25])
-            if len(matches) > 25:
-                formatted += f"\n    ... and {len(matches) - 25} more"
-
-            fail(
-                f"Ambiguous {label} raster in:\n"
-                f"  {path_to_str(folder)}\n"
-                f"Pattern:\n"
-                f"  {pattern}\n"
-                f"Matched files:\n"
-                f"{formatted}\n\n"
-                "Please clean/rename the folder or make the filename more explicit."
-            )
-
-    if allow_missing:
-        return None
-
-    fail(
-        f"Could not find {label} raster in:\n"
-        f"  {path_to_str(folder)}\n"
-        "Patterns tried:\n"
-        + "\n".join(f"  - {pattern}" for pattern in patterns)
-    )
-
-
-def find_city_files(instance_root: Path, city: str) -> Dict[str, Optional[Path]]:
-    s2_dir = instance_root / "s2_filled" / city
-    s1_dir = instance_root / "s1_ready" / city
-    label_dir = instance_root / "labels" / city
-    rtc_dir = instance_root / "s1_rtc_ready" / city
-
-    s2_path = find_one_raster(
-        s2_dir,
-        label="S2",
-        patterns=[
-            f"{city}_s2_12bands_reflectance_10m.tif",
-            f"{city}_s2_12bands_reflectance_10m.tiff",
-            f"{city}_s2_12bands_reflectance_10m_filled.tif",
-            f"{city}_s2_filled_12bands_reflectance_10m.tif",
-            f"{city}*s2*12*reflectance*10m*.tif",
-            f"{city}*s2*filled*.tif",
-            "*s2*12*reflectance*10m*.tif",
-            "*s2*filled*.tif",
-            "*.tif",
-            "*.tiff",
-        ],
-    )
-
-    s1_snap_grd_path = find_one_raster(
-        s1_dir,
-        label="S1_SNAP_GRD",
-        patterns=[
-            f"{city}_s1_ready_vv_vh_vvdiff_10m_aligned.tif",
-            f"{city}_s1_ready_vv_vh_vvdiff_10m_aligned.tiff",
-            f"{city}*s1_ready*vv*vh*vvdiff*10m*aligned*.tif",
-            f"{city}*s1*ready*.tif",
-            "*s1_ready*vv*vh*vvdiff*10m*aligned*.tif",
-            "*s1*ready*.tif",
-            "*.tif",
-            "*.tiff",
-        ],
-    )
-
-    label_path = find_one_raster(
-        label_dir,
-        label="label",
-        patterns=[
-            f"{city}_label_final.tif",
-            f"{city}_label_final.tiff",
-            f"{city}*label_final*.tif",
-            f"{city}*label*.tif",
-            "*label_final*.tif",
-            "*label*.tif",
-            "*.tif",
-            "*.tiff",
-        ],
-    )
-
-    s1_rtc_path = find_one_raster(
-        rtc_dir,
-        label="S1_RTC",
-        allow_missing=True,
-        patterns=[
-            f"{city}_s1_rtc_vv_vh_vvdiff_10m_aligned.tif",
-            f"{city}_s1_rtc_vv_vh_vvdiff_10m_aligned.tiff",
-            f"{city}*s1_rtc*vv*vh*vvdiff*10m*aligned*.tif",
-            f"{city}*rtc*.tif",
-            "*s1_rtc*vv*vh*vvdiff*10m*aligned*.tif",
-            "*rtc*.tif",
-            "*.tif",
-            "*.tiff",
-        ],
-    )
-
-    return {
-        "s2": s2_path,
-        "s1_snap_grd": s1_snap_grd_path,
-        "label": label_path,
-        "s1_rtc": s1_rtc_path,
-    }
-
-
-# ---------------------------------------------------------------------
-# Raster validation
-# ---------------------------------------------------------------------
-
-def transforms_equal(a, b, tolerance: float) -> bool:
-    if tolerance <= 0:
-        return a == b
-
-    return all(
-        abs(float(x) - float(y)) <= tolerance
-        for x, y in zip(tuple(a), tuple(b))
-    )
-
-
-def validate_city_stack(
-    city: str,
-    files: Dict[str, Optional[Path]],
-    expected_s2_bands: int,
-    expected_s1_bands: int,
-    expected_label_bands: int,
-    transform_tolerance: float,
-    require_s1_rtc: bool,
-) -> Dict[str, object]:
-    s2_path = files["s2"]
-    s1_path = files["s1_snap_grd"]
-    label_path = files["label"]
-    rtc_path = files["s1_rtc"]
-
-    if s2_path is None:
-        fail(f"{city}: missing S2 path.")
-    if s1_path is None:
-        fail(f"{city}: missing S1_SNAP_GRD path.")
-    if label_path is None:
-        fail(f"{city}: missing label path.")
-
-    problems: List[str] = []
-
-    with rasterio.open(s2_path) as s2, rasterio.open(s1_path) as s1, rasterio.open(label_path) as label:
-        if s2.count != expected_s2_bands:
-            problems.append(f"S2 band count = {s2.count}, expected {expected_s2_bands}")
-
-        if s1.count != expected_s1_bands:
-            problems.append(f"S1_SNAP_GRD band count = {s1.count}, expected {expected_s1_bands}")
-
-        if label.count != expected_label_bands:
-            problems.append(f"label band count = {label.count}, expected {expected_label_bands}")
-
-        if s1.width != s2.width or s1.height != s2.height:
-            problems.append(
-                f"S1_SNAP_GRD shape ({s1.height}, {s1.width}) != "
-                f"S2 shape ({s2.height}, {s2.width})"
-            )
-
-        if label.width != s2.width or label.height != s2.height:
-            problems.append(
-                f"label shape ({label.height}, {label.width}) != "
-                f"S2 shape ({s2.height}, {s2.width})"
-            )
-
-        if s1.crs != s2.crs:
-            problems.append(f"S1_SNAP_GRD CRS {s1.crs} != S2 CRS {s2.crs}")
-
-        if label.crs != s2.crs:
-            problems.append(f"label CRS {label.crs} != S2 CRS {s2.crs}")
-
-        if not transforms_equal(s1.transform, s2.transform, transform_tolerance):
-            problems.append("S1_SNAP_GRD transform does not match S2 transform")
-
-        if not transforms_equal(label.transform, s2.transform, transform_tolerance):
-            problems.append("label transform does not match S2 transform")
-
-        raster_height = s2.height
-        raster_width = s2.width
-        crs = str(s2.crs)
-        transform = tuple(float(v) for v in s2.transform)
-
-    rtc_status = "missing"
-
-    if rtc_path is not None and rtc_path.exists():
-        rtc_status = "present"
-
-        with rasterio.open(s2_path) as s2, rasterio.open(rtc_path) as rtc:
-            if rtc.count != expected_s1_bands:
-                problems.append(f"S1_RTC band count = {rtc.count}, expected {expected_s1_bands}")
-
-            if rtc.width != s2.width or rtc.height != s2.height:
-                problems.append(
-                    f"S1_RTC shape ({rtc.height}, {rtc.width}) != "
-                    f"S2 shape ({s2.height}, {s2.width})"
-                )
-
-            if rtc.crs != s2.crs:
-                problems.append(f"S1_RTC CRS {rtc.crs} != S2 CRS {s2.crs}")
-
-            if not transforms_equal(rtc.transform, s2.transform, transform_tolerance):
-                problems.append("S1_RTC transform does not match S2 transform")
-
-    elif require_s1_rtc:
-        problems.append("S1_RTC is required but missing")
-
-    return {
-        "ok": len(problems) == 0,
-        "problems": problems,
-        "raster_height": raster_height,
-        "raster_width": raster_width,
-        "crs": crs,
-        "transform": transform,
-        "rtc_status": rtc_status,
-    }
-
-
-# ---------------------------------------------------------------------
-# Tiling logic
-# ---------------------------------------------------------------------
-
-def build_window_starts(size: int, patch_size: int, stride: int, edge_mode: str) -> List[int]:
-    """
-    Build start indices for one raster dimension.
-
-    cover mode:
-        Include final edge window at size - patch_size when needed.
-
-    drop mode:
-        Only include regular stride windows.
-    """
-
-    if patch_size <= 0:
-        fail("--patch-size must be positive.")
-
-    if stride <= 0:
-        fail("--stride must be positive.")
-
-    if size < patch_size:
-        fail(
-            f"Raster dimension {size} is smaller than patch_size={patch_size}. "
-            "This script does not pad smaller rasters."
-        )
-
-    if edge_mode not in {"cover", "drop"}:
-        fail(f"Unsupported edge_mode: {edge_mode}. Expected 'cover' or 'drop'.")
-
-    starts = list(range(0, size - patch_size + 1, stride))
-
-    if edge_mode == "cover":
-        last_start = size - patch_size
-
-        if not starts:
-            starts = [last_start]
-        elif starts[-1] != last_start:
-            starts.append(last_start)
-
-    # Remove duplicates while preserving sorted order.
-    return sorted(set(starts))
-
-
-def generate_city_patch_rows(
-    city: str,
-    region: str,
-    raster_height: int,
-    raster_width: int,
-    patch_size: int,
-    stride: int,
-    edge_mode: str,
-    files: Dict[str, Optional[Path]],
-) -> Tuple[List[Dict[str, object]], int, int]:
-    row_starts = build_window_starts(raster_height, patch_size, stride, edge_mode)
-    col_starts = build_window_starts(raster_width, patch_size, stride, edge_mode)
-
-    rows: List[Dict[str, object]] = []
-    city_patch_index = 0
-
-    for row_start in row_starts:
-        for col_start in col_starts:
-            patch_id = (
-                f"{city}__ps{patch_size}_st{stride}"
-                f"__r{row_start:06d}_c{col_start:06d}"
-            )
-
-            rows.append(
-                {
-                    "patch_id": patch_id,
-                    "city": city,
-                    "region": region,
-                    "city_patch_index": city_patch_index,
-                    "row_start": row_start,
-                    "col_start": col_start,
-                    "height": patch_size,
-                    "width": patch_size,
-                    "patch_size": patch_size,
-                    "stride": stride,
-                    "edge_mode": edge_mode,
-                    "raster_height": raster_height,
-                    "raster_width": raster_width,
-                    "source_s2_path": path_to_str(files["s2"]),
-                    "source_s1_snap_grd_path": path_to_str(files["s1_snap_grd"]),
-                    "source_s1_rtc_path": path_to_str(files["s1_rtc"]),
-                    "source_label_path": path_to_str(files["label"]),
-                }
-            )
-
-            city_patch_index += 1
-
-    return rows, len(row_starts), len(col_starts)
-
-
-# ---------------------------------------------------------------------
-# Output writers
-# ---------------------------------------------------------------------
 
 def write_csv(path: Path, rows: List[Dict[str, object]], overwrite: bool) -> None:
     ensure_output_can_be_written(path, overwrite)
 
     if not rows:
-        fail("No rows were generated. Refusing to write an empty CSV.")
+        fail(f"No rows to write: {path_to_str(path)}")
 
     fieldnames = list(rows[0].keys())
 
@@ -641,11 +141,13 @@ def write_json(path: Path, payload: Dict[str, object], overwrite: bool) -> None:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
-def write_markdown(path: Path, summary: Dict[str, object], overwrite: bool) -> None:
+def write_markdown(
+    path: Path,
+    summary: Dict[str, object],
+    city_rows: List[Dict[str, object]],
+    overwrite: bool,
+) -> None:
     ensure_output_can_be_written(path, overwrite)
-
-    city_summaries = summary["city_summaries"]
-    patches_by_region = summary["patches_by_region"]
 
     lines: List[str] = []
 
@@ -655,59 +157,545 @@ def write_markdown(path: Path, summary: Dict[str, object], overwrite: bool) -> N
     lines.append("")
     lines.append(f"- Created UTC: `{summary['created_utc']}`")
     lines.append(f"- Instance root: `{summary['instance_root']}`")
+    lines.append(f"- S2 root: `{summary['s2_root']}`")
+    lines.append(f"- S1 SNAP-GRD root: `{summary['s1_snap_root']}`")
+    lines.append(f"- S1 RTC root: `{summary['s1_rtc_root']}`")
+    lines.append(f"- Label root: `{summary['label_root']}`")
+    lines.append(f"- Output CSV: `{summary['outputs']['csv']}`")
     lines.append(f"- Patch size: `{summary['parameters']['patch_size']}`")
     lines.append(f"- Stride: `{summary['parameters']['stride']}`")
     lines.append(f"- Edge mode: `{summary['parameters']['edge_mode']}`")
     lines.append(f"- Cities indexed: `{summary['n_cities_indexed']}`")
     lines.append(f"- Total patches: `{summary['total_patches']}`")
-    lines.append(f"- Missing required file count: `{summary['missing_required_file_count']}`")
-    lines.append(f"- Alignment problem count: `{summary['alignment_problem_count']}`")
-    lines.append(f"- RTC present cities: `{summary['rtc_present_city_count']}`")
-    lines.append(f"- RTC missing cities: `{summary['rtc_missing_city_count']}`")
+    lines.append(f"- Validation failures: `{summary['n_validation_failures']}`")
     lines.append("")
 
-    lines.append("## Outputs")
+    lines.append("## Band contract")
     lines.append("")
-    lines.append(f"- CSV: `{summary['outputs']['csv']}`")
-    lines.append(f"- JSON: `{summary['outputs']['json']}`")
-    lines.append(f"- Markdown: `{summary['outputs']['markdown']}`")
+    lines.append("| Modality | Expected bands | Convention |")
+    lines.append("|---|---:|---|")
+    lines.append("| S2 | 12 | Sentinel-2 reflectance bands |")
+    lines.append("| S1 SNAP-GRD | 3 | VV, VH, VV_minus_VH |")
+    lines.append("| S1 RTC | 2 | VV, VH |")
+    lines.append("| Label | 1 | Binary favela label |")
     lines.append("")
 
-    lines.append("## Patch counts by city")
+    lines.append("## City-level index summary")
     lines.append("")
     lines.append(
-        "| city | region | raster height | raster width | row windows | col windows | patches | RTC status |"
+        "| city | region | patches | width | height | S2 bands | SNAP bands | RTC bands | label bands | status | notes |"
     )
-    lines.append(
-        "|---|---|---:|---:|---:|---:|---:|---|"
-    )
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|")
 
-    for item in city_summaries:
+    for row in city_rows:
         lines.append(
-            f"| {item['city']} | {item['region']} | "
-            f"{item['raster_height']} | {item['raster_width']} | "
-            f"{item['n_row_windows']} | {item['n_col_windows']} | "
-            f"{item['n_patches']} | {item['rtc_status']} |"
+            f"| {row['city']} | "
+            f"{row['region']} | "
+            f"{row['n_patches']} | "
+            f"{row['width']} | "
+            f"{row['height']} | "
+            f"{row['s2_band_count']} | "
+            f"{row['s1_snap_band_count']} | "
+            f"{row['s1_rtc_band_count']} | "
+            f"{row['label_band_count']} | "
+            f"{row['status']} | "
+            f"{row['notes']} |"
         )
 
     lines.append("")
-    lines.append("## Patch counts by region")
+    lines.append("## Interpretation")
     lines.append("")
-    lines.append("| region | patches |")
-    lines.append("|---|---:|")
-
-    for region, count in sorted(patches_by_region.items()):
-        lines.append(f"| {region} | {count} |")
-
-    lines.append("")
-    lines.append("## Notes")
-    lines.append("")
-    lines.append("- This script writes only a patch index. It does not export physical patch rasters.")
-    lines.append("- `source_s1_rtc_path` is blank when `s1_rtc_ready/` is not available yet.")
-    lines.append("- Downstream CROMA/PyTorch dataloaders should read GeoTIFF windows using `row_start`, `col_start`, `height`, and `width`.")
+    lines.append("- This index intentionally accepts RTC as a 2-band VV/VH product.")
+    lines.append("- SNAP-GRD remains a 3-band product because it includes VV_minus_VH.")
+    lines.append("- For the main CROMA RTC-vs-SNAP comparison, both radar variants should use VV/VH only.")
+    lines.append("- The patch index stores source paths and band counts so downstream metadata and dataloaders can choose the correct modality.")
 
     with path.open("w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------
+# City-region table
+# ---------------------------------------------------------------------
+
+def load_city_region_map(path: Path) -> Dict[str, str]:
+    rows = read_csv_rows_optional(path)
+
+    if not rows:
+        log("WARN", f"City-region table not found or empty: {path_to_str(path)}")
+        return {}
+
+    fieldnames = set(rows[0].keys())
+
+    city_col_candidates = ["city", "city_name", "name"]
+    region_col_candidates = ["region", "macroregion", "macro_region"]
+
+    city_col = None
+    region_col = None
+
+    for col in city_col_candidates:
+        if col in fieldnames:
+            city_col = col
+            break
+
+    for col in region_col_candidates:
+        if col in fieldnames:
+            region_col = col
+            break
+
+    if city_col is None or region_col is None:
+        log(
+            "WARN",
+            f"Could not infer city/region columns from {path_to_str(path)}. "
+            f"Columns are: {sorted(fieldnames)}"
+        )
+        return {}
+
+    mapping: Dict[str, str] = {}
+
+    for row in rows:
+        city = normalize_city(row[city_col])
+        region = str(row[region_col]).strip()
+        mapping[city] = region
+
+    return mapping
+
+
+def default_city_region_table(instance_root: Path) -> Path:
+    """
+    Typical structure:
+
+        D:/post_processing_dataset/dataset_instances/instance_C.../
+        D:/post_processing_dataset/metadata/city_region_table.csv
+
+    This function walks upward and checks common locations.
+    """
+
+    candidates = [
+        instance_root.parent.parent / "metadata" / "city_region_table.csv",
+        instance_root.parent / "metadata" / "city_region_table.csv",
+        instance_root / "metadata" / "city_region_table.csv",
+        Path("D:/post_processing_dataset/metadata/city_region_table.csv"),
+    ]
+
+    for path in candidates:
+        if path.exists():
+            return path
+
+    return candidates[0]
+
+
+# ---------------------------------------------------------------------
+# Raster discovery
+# ---------------------------------------------------------------------
+
+EXCLUDE_NAME_PARTS = (
+    "valid_mask",
+    "fill_level",
+    "fill_source",
+    "nodata",
+    "qa",
+    "mask_before",
+    "mask_after",
+    "summary",
+    "preview",
+    "png",
+    "jpg",
+)
+
+
+def is_excluded_raster(path: Path) -> bool:
+    lower = path.name.lower()
+    return any(part in lower for part in EXCLUDE_NAME_PARTS)
+
+
+def candidate_tifs(folder: Path, patterns: Sequence[str]) -> List[Path]:
+    matches: List[Path] = []
+
+    for pattern in patterns:
+        for path in folder.glob(pattern):
+            if path.is_file() and path.suffix.lower() in {".tif", ".tiff"}:
+                if not is_excluded_raster(path):
+                    matches.append(path)
+
+    return sorted(set(matches))
+
+
+def choose_single_raster(folder: Path, city: str, patterns: Sequence[str], label: str) -> Path:
+    if not folder.exists():
+        fail(f"Missing {label} folder for {city}: {path_to_str(folder)}")
+
+    for pattern in patterns:
+        matches = candidate_tifs(folder, [pattern])
+
+        if len(matches) == 1:
+            return matches[0]
+
+        if len(matches) > 1:
+            formatted = "\n".join(f"  - {path_to_str(p)}" for p in matches[:30])
+            fail(
+                f"Ambiguous {label} raster for city {city} using pattern `{pattern}`:\n"
+                f"{formatted}"
+            )
+
+    fail(f"Could not find {label} raster for city {city} in {path_to_str(folder)}")
+
+
+def find_s2_path(s2_root: Path, city: str) -> Path:
+    city = normalize_city(city)
+    folder = s2_root / city
+
+    patterns = [
+        f"{city}_s2_12bands_reflectance_10m.tif",
+        f"{city}_s2_12bands_reflectance_10m_filled.tif",
+        f"{city}_s2_filled_12bands_reflectance_10m.tif",
+        f"{city}*s2*12*reflectance*10m*.tif",
+        f"{city}*s2*filled*.tif",
+        "*s2*12*reflectance*10m*.tif",
+        "*s2*filled*.tif",
+        "*.tif",
+        "*.tiff",
+    ]
+
+    return choose_single_raster(folder, city, patterns, "S2")
+
+
+def find_s1_snap_path(s1_root: Path, city: str) -> Path:
+    city = normalize_city(city)
+    folder = s1_root / city
+
+    patterns = [
+        f"{city}_s1_snap_vv_vh_vvdiff_10m_aligned.tif",
+        f"{city}_s1_grd_vv_vh_vvdiff_10m_aligned.tif",
+        f"{city}*snap*vv*vh*.tif",
+        f"{city}*grd*vv*vh*.tif",
+        f"{city}*s1*vv*vh*vvdiff*.tif",
+        f"{city}*s1*.tif",
+        "*snap*vv*vh*.tif",
+        "*grd*vv*vh*.tif",
+        "*s1*vv*vh*vvdiff*.tif",
+        "*s1*.tif",
+        "*.tif",
+        "*.tiff",
+    ]
+
+    return choose_single_raster(folder, city, patterns, "S1 SNAP-GRD")
+
+
+def find_s1_rtc_path(s1_rtc_root: Path, city: str) -> Path:
+    city = normalize_city(city)
+    folder = s1_rtc_root / city
+
+    patterns = [
+        f"{city}_s1_rtc_vv_vh_10m_aligned.tif",
+        f"{city}_s1_rtc_vv_vh_10m_aligned.tiff",
+        f"{city}*s1_rtc*vv*vh*10m*aligned*.tif",
+        f"{city}*rtc*vv*vh*.tif",
+        "*s1_rtc*vv*vh*10m*aligned*.tif",
+        "*rtc*vv*vh*.tif",
+        "*.tif",
+        "*.tiff",
+    ]
+
+    return choose_single_raster(folder, city, patterns, "S1 RTC")
+
+
+def find_label_path(label_root: Path, city: str) -> Path:
+    city = normalize_city(city)
+    folder = label_root / city
+
+    patterns = [
+        f"{city}_label_final.tif",
+        f"{city}_label_final.tiff",
+        f"{city}*label_final*.tif",
+        f"{city}*label*.tif",
+        "*label_final*.tif",
+        "*label*.tif",
+        "*.tif",
+        "*.tiff",
+    ]
+
+    return choose_single_raster(folder, city, patterns, "label")
+
+
+# ---------------------------------------------------------------------
+# Raster validation
+# ---------------------------------------------------------------------
+
+def affine_six(transform) -> Tuple[float, float, float, float, float, float]:
+    return (
+        float(transform.a),
+        float(transform.b),
+        float(transform.c),
+        float(transform.d),
+        float(transform.e),
+        float(transform.f),
+    )
+
+
+def transforms_equal(a, b, tolerance: float) -> bool:
+    aa = affine_six(a)
+    bb = affine_six(b)
+
+    return all(abs(x - y) <= tolerance for x, y in zip(aa, bb))
+
+
+def raster_info(path: Path) -> Dict[str, object]:
+    with rasterio.open(path) as src:
+        return {
+            "path": path_to_str(path),
+            "band_count": int(src.count),
+            "width": int(src.width),
+            "height": int(src.height),
+            "crs": "" if src.crs is None else str(src.crs),
+            "transform": affine_six(src.transform),
+            "dtype": ";".join(str(x) for x in src.dtypes),
+            "descriptions": ";".join("" if d is None else str(d) for d in src.descriptions),
+        }
+
+
+def validate_stack_for_city(
+    *,
+    city: str,
+    s2_path: Path,
+    s1_snap_path: Path,
+    s1_rtc_path: Path,
+    label_path_: Path,
+    expected_s2_bands: int,
+    expected_s1_snap_bands: int,
+    expected_s1_rtc_bands: int,
+    expected_label_bands: int,
+    transform_tolerance: float,
+) -> Tuple[Dict[str, object], List[str]]:
+    errors: List[str] = []
+
+    with rasterio.open(s2_path) as s2, \
+         rasterio.open(s1_snap_path) as snap, \
+         rasterio.open(s1_rtc_path) as rtc, \
+         rasterio.open(label_path_) as label:
+
+        if s2.count != expected_s2_bands:
+            errors.append(f"S2 band count = {s2.count}, expected {expected_s2_bands}")
+
+        if snap.count != expected_s1_snap_bands:
+            errors.append(f"S1_SNAP band count = {snap.count}, expected {expected_s1_snap_bands}")
+
+        if rtc.count != expected_s1_rtc_bands:
+            errors.append(f"S1_RTC band count = {rtc.count}, expected {expected_s1_rtc_bands}")
+
+        if label.count != expected_label_bands:
+            errors.append(f"Label band count = {label.count}, expected {expected_label_bands}")
+
+        reference = {
+            "width": s2.width,
+            "height": s2.height,
+            "crs": s2.crs,
+            "transform": s2.transform,
+        }
+
+        for name, src in [
+            ("S1_SNAP", snap),
+            ("S1_RTC", rtc),
+            ("Label", label),
+        ]:
+            if src.width != reference["width"] or src.height != reference["height"]:
+                errors.append(
+                    f"{name} shape mismatch: "
+                    f"{src.width}x{src.height} != {reference['width']}x{reference['height']}"
+                )
+
+            if src.crs != reference["crs"]:
+                errors.append(f"{name} CRS mismatch: {src.crs} != {reference['crs']}")
+
+            if not transforms_equal(src.transform, reference["transform"], transform_tolerance):
+                errors.append(f"{name} transform mismatch with S2")
+
+        info = {
+            "width": int(s2.width),
+            "height": int(s2.height),
+            "crs": "" if s2.crs is None else str(s2.crs),
+            "transform": affine_six(s2.transform),
+            "s2_band_count": int(s2.count),
+            "s1_snap_band_count": int(snap.count),
+            "s1_rtc_band_count": int(rtc.count),
+            "label_band_count": int(label.count),
+        }
+
+    return info, errors
+
+
+# ---------------------------------------------------------------------
+# Patch grid
+# ---------------------------------------------------------------------
+
+def build_axis_starts(length: int, patch_size: int, stride: int, edge_mode: str) -> List[int]:
+    if length < patch_size:
+        fail(f"Raster dimension {length} is smaller than patch size {patch_size}")
+
+    starts = list(range(0, length - patch_size + 1, stride))
+
+    if not starts:
+        starts = [0]
+
+    if edge_mode == "cover":
+        last = length - patch_size
+        if starts[-1] != last:
+            starts.append(last)
+
+    elif edge_mode == "drop":
+        pass
+
+    else:
+        fail(f"Unsupported edge mode: {edge_mode}")
+
+    return sorted(set(starts))
+
+
+def build_patch_rows_for_city(
+    *,
+    city: str,
+    region: str,
+    width: int,
+    height: int,
+    patch_size: int,
+    stride: int,
+    edge_mode: str,
+    s2_path: Path,
+    s1_snap_path: Path,
+    s1_rtc_path: Path,
+    label_path_: Path,
+    s2_band_count: int,
+    s1_snap_band_count: int,
+    s1_rtc_band_count: int,
+    label_band_count: int,
+) -> List[Dict[str, object]]:
+    row_starts = build_axis_starts(height, patch_size, stride, edge_mode)
+    col_starts = build_axis_starts(width, patch_size, stride, edge_mode)
+
+    rows: List[Dict[str, object]] = []
+
+    city = normalize_city(city)
+
+    patch_counter = 0
+
+    for row_start in row_starts:
+        for col_start in col_starts:
+            patch_counter += 1
+
+            patch_id = (
+                f"{city}"
+                f"__r{int(row_start):06d}"
+                f"__c{int(col_start):06d}"
+                f"__ps{int(patch_size)}"
+                f"__st{int(stride)}"
+            )
+
+            rows.append(
+                {
+                    "patch_id": patch_id,
+                    "city": city,
+                    "region": region,
+                    "row_start": int(row_start),
+                    "col_start": int(col_start),
+                    "height": int(patch_size),
+                    "width": int(patch_size),
+                    "patch_size": int(patch_size),
+                    "stride": int(stride),
+                    "edge_mode": edge_mode,
+                    "city_width": int(width),
+                    "city_height": int(height),
+                    "source_s2_path": path_to_str(s2_path),
+                    "source_s1_path": path_to_str(s1_snap_path),
+                    "source_s1_snap_path": path_to_str(s1_snap_path),
+                    "source_s1_rtc_path": path_to_str(s1_rtc_path),
+                    "source_label_path": path_to_str(label_path_),
+                    "s2_exists": True,
+                    "s1_exists": True,
+                    "s1_snap_exists": True,
+                    "s1_rtc_exists": True,
+                    "label_exists": True,
+                    "s2_band_count": int(s2_band_count),
+                    "s1_band_count": int(s1_snap_band_count),
+                    "s1_snap_band_count": int(s1_snap_band_count),
+                    "s1_rtc_band_count": int(s1_rtc_band_count),
+                    "label_band_count": int(label_band_count),
+                }
+            )
+
+    return rows
+
+
+# ---------------------------------------------------------------------
+# City discovery
+# ---------------------------------------------------------------------
+
+def discover_cities(s2_root: Path) -> List[str]:
+    if not s2_root.exists():
+        fail(f"S2 root does not exist: {path_to_str(s2_root)}")
+
+    cities = [
+        normalize_city(p.name)
+        for p in s2_root.iterdir()
+        if p.is_dir()
+    ]
+
+    cities = sorted(set(cities))
+
+    if not cities:
+        fail(f"No city folders found in S2 root: {path_to_str(s2_root)}")
+
+    return cities
+
+
+# ---------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------
+
+def build_summary(
+    *,
+    instance_root: Path,
+    s2_root: Path,
+    s1_snap_root: Path,
+    s1_rtc_root: Path,
+    label_root: Path,
+    city_region_table: Path,
+    patch_rows: List[Dict[str, object]],
+    city_rows: List[Dict[str, object]],
+    validation_failures: List[str],
+    args: argparse.Namespace,
+    csv_path: Path,
+    json_path: Path,
+    md_path: Path,
+) -> Dict[str, object]:
+    return {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "instance_root": path_to_str(instance_root),
+        "s2_root": path_to_str(s2_root),
+        "s1_snap_root": path_to_str(s1_snap_root),
+        "s1_rtc_root": path_to_str(s1_rtc_root),
+        "label_root": path_to_str(label_root),
+        "city_region_table": path_to_str(city_region_table),
+        "n_cities_indexed": len(city_rows),
+        "total_patches": len(patch_rows),
+        "n_validation_failures": len(validation_failures),
+        "validation_failures": validation_failures,
+        "parameters": {
+            "patch_size": args.patch_size,
+            "stride": args.stride,
+            "edge_mode": args.edge_mode,
+            "expected_s2_bands": args.expected_s2_bands,
+            "expected_s1_snap_bands": args.expected_s1_snap_bands,
+            "expected_s1_rtc_bands": args.expected_s1_rtc_bands,
+            "expected_label_bands": args.expected_label_bands,
+            "transform_tolerance": args.transform_tolerance,
+        },
+        "outputs": {
+            "csv": path_to_str(csv_path),
+            "json": path_to_str(json_path),
+            "markdown": path_to_str(md_path),
+        },
+        "city_rows": city_rows,
+    }
 
 
 # ---------------------------------------------------------------------
@@ -716,7 +704,7 @@ def write_markdown(path: Path, summary: Dict[str, object], overwrite: bool) -> N
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build a 224x224 overlapping patch tiling index for instance C."
+        description="Build Instance C 224x224 patch tiling index with 2-band RTC support."
     )
 
     parser.add_argument(
@@ -727,61 +715,66 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--patch-size",
-        type=int,
-        default=224,
-        help="Patch size in pixels. Default: 224.",
-    )
-
-    parser.add_argument(
-        "--stride",
-        type=int,
-        default=112,
-        help="Stride in pixels. Default: 112.",
-    )
-
-    parser.add_argument(
-        "--edge-mode",
-        choices=["cover", "drop"],
-        default="cover",
-        help="Window edge handling. 'cover' adds edge windows. Default: cover.",
-    )
-
-    parser.add_argument(
-        "--output-dir",
+        "--s2-root",
         type=Path,
         default=None,
-        help=(
-            "Optional output directory. "
-            "Default: <instance-root>/metadata/instance_C_patches"
-        ),
+        help="Default: <instance-root>/s2_filled.",
+    )
+
+    parser.add_argument(
+        "--s1-root",
+        type=Path,
+        default=None,
+        help="S1 SNAP-GRD root. Default: <instance-root>/s1_ready.",
+    )
+
+    parser.add_argument(
+        "--s1-rtc-root",
+        type=Path,
+        default=None,
+        help="S1 RTC root. Default: <instance-root>/s1_rtc_ready.",
+    )
+
+    parser.add_argument(
+        "--label-root",
+        type=Path,
+        default=None,
+        help="Default: <instance-root>/labels.",
     )
 
     parser.add_argument(
         "--city-region-table",
         type=Path,
         default=None,
-        help="Optional explicit path to city_region_table.csv.",
+        help="Default: auto-detect city_region_table.csv.",
     )
 
     parser.add_argument(
-        "--cities",
-        nargs="+",
+        "--output-dir",
+        type=Path,
         default=None,
-        help="Optional city subset for debugging. Default: all discovered cities.",
+        help="Default: <instance-root>/metadata/instance_C_patches.",
     )
 
     parser.add_argument(
-        "--expected-city-count",
+        "--patch-size",
         type=int,
-        default=26,
-        help="Expected number of cities when --cities is not used. Default: 26.",
+        default=224,
+        help="Patch size. Default: 224.",
     )
 
     parser.add_argument(
-        "--no-require-expected-city-count",
-        action="store_true",
-        help="Warn instead of failing if discovered city count differs from expected count.",
+        "--stride",
+        type=int,
+        default=112,
+        help="Patch stride. Default: 112.",
+    )
+
+    parser.add_argument(
+        "--edge-mode",
+        choices=["cover", "drop"],
+        default="cover",
+        help="Use cover to include edge patches. Default: cover.",
     )
 
     parser.add_argument(
@@ -792,10 +785,17 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--expected-s1-bands",
+        "--expected-s1-snap-bands",
         type=int,
         default=3,
-        help="Expected S1 band count. Default: 3.",
+        help="Expected S1 SNAP-GRD band count. Default: 3.",
+    )
+
+    parser.add_argument(
+        "--expected-s1-rtc-bands",
+        type=int,
+        default=2,
+        help="Expected S1 RTC band count. Default: 2.",
     )
 
     parser.add_argument(
@@ -809,25 +809,20 @@ def parse_args() -> argparse.Namespace:
         "--transform-tolerance",
         type=float,
         default=0.0,
-        help="Affine transform tolerance. Default 0.0 means exact match.",
+        help="Affine transform tolerance. Default: 0.0 exact match.",
     )
 
     parser.add_argument(
-        "--require-s1-rtc",
-        action="store_true",
-        help="Fail if S1_RTC is missing. Use later when s1_rtc_ready/ exists.",
-    )
-
-    parser.add_argument(
-        "--allow-unknown-region",
-        action="store_true",
-        help="Allow unknown city region and write region as UNKNOWN.",
+        "--cities",
+        nargs="+",
+        default=None,
+        help="Optional city subset.",
     )
 
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Overwrite existing output CSV/JSON/Markdown files.",
+        help="Overwrite outputs.",
     )
 
     return parser.parse_args()
@@ -841,260 +836,212 @@ def main() -> None:
     args = parse_args()
 
     instance_root: Path = args.instance_root
-    output_dir: Path = args.output_dir or (
-        instance_root / "metadata" / "instance_C_patches"
-    )
 
-    s2_root = instance_root / "s2_filled"
-    s1_root = instance_root / "s1_ready"
-    label_root = instance_root / "labels"
-    rtc_root = instance_root / "s1_rtc_ready"
+    s2_root: Path = args.s2_root or (instance_root / "s2_filled")
+    s1_snap_root: Path = args.s1_root or (instance_root / "s1_ready")
+    s1_rtc_root: Path = args.s1_rtc_root or (instance_root / "s1_rtc_ready")
+    label_root: Path = args.label_root or (instance_root / "labels")
+    output_dir: Path = args.output_dir or (instance_root / "metadata" / "instance_C_patches")
+    city_region_table: Path = args.city_region_table or default_city_region_table(instance_root)
+
+    output_stem = f"patch_tiling_index_ps{args.patch_size}_st{args.stride}_{args.edge_mode}"
+    csv_path = output_dir / f"{output_stem}.csv"
+    json_path = output_dir / f"{output_stem}.json"
+    md_path = output_dir / f"{output_stem}.md"
 
     log("STEP", "Building instance C 224x224 patch tiling index.")
     log("INFO", f"Instance root: {path_to_str(instance_root)}")
     log("INFO", f"S2 root:       {path_to_str(s2_root)}")
-    log("INFO", f"S1 root:       {path_to_str(s1_root)}")
+    log("INFO", f"S1 root:       {path_to_str(s1_snap_root)}")
     log("INFO", f"Label root:    {path_to_str(label_root)}")
-    log("INFO", f"S1 RTC root:   {path_to_str(rtc_root)}")
+    log("INFO", f"S1 RTC root:   {path_to_str(s1_rtc_root)}")
     log("INFO", f"Output dir:    {path_to_str(output_dir)}")
+    log("INFO", f"Loading city-region table: {path_to_str(city_region_table)}")
 
     if not instance_root.exists():
         fail(f"Instance root does not exist: {path_to_str(instance_root)}")
 
-    if not s2_root.exists():
-        fail(f"Missing required folder: {path_to_str(s2_root)}")
-
-    if not s1_root.exists():
-        fail(f"Missing required folder: {path_to_str(s1_root)}")
-
-    if not label_root.exists():
-        fail(f"Missing required folder: {path_to_str(label_root)}")
-
-    if not rtc_root.exists():
-        log(
-            "WARN",
-            "s1_rtc_ready/ does not exist yet. source_s1_rtc_path will be blank unless files are found later.",
-        )
-
-    city_region_mapping, city_region_table_used = load_city_region_mapping(
-        instance_root=instance_root,
-        explicit_table=args.city_region_table,
-    )
-
-    discovered_cities = discover_cities_from_s2(s2_root)
+    city_region_map = load_city_region_map(city_region_table)
 
     if args.cities:
-        requested_cities = [normalize_city_name(city) for city in args.cities]
-        requested_set = set(requested_cities)
-
-        missing_requested = sorted(requested_set - set(discovered_cities))
-        if missing_requested:
-            fail(
-                "The following requested cities were not found under s2_filled/:\n"
-                + "\n".join(f"  - {city}" for city in missing_requested)
-            )
-
-        cities = [city for city in discovered_cities if city in requested_set]
-        log("WARN", f"Running on city subset: {', '.join(cities)}")
+        cities = sorted(normalize_city(c) for c in args.cities)
     else:
-        cities = discovered_cities
-
-    if not args.cities and len(cities) != args.expected_city_count:
-        message = (
-            f"Discovered {len(cities)} cities, but expected {args.expected_city_count}."
-        )
-
-        if args.no_require_expected_city_count:
-            log("WARN", message)
-        else:
-            fail(
-                message
-                + "\nUse --no-require-expected-city-count only if this is intentional."
-            )
+        cities = discover_cities(s2_root)
 
     log("INFO", f"Cities to index: {len(cities)}")
 
-    all_rows: List[Dict[str, object]] = []
-    city_summaries: List[Dict[str, object]] = []
-    alignment_problem_records: List[Dict[str, object]] = []
+    all_patch_rows: List[Dict[str, object]] = []
+    city_summary_rows: List[Dict[str, object]] = []
+    validation_failures: List[str] = []
 
     for city in cities:
+        city = normalize_city(city)
+        region = city_region_map.get(city, "unknown")
+
         log("STEP", f"Processing city: {city}")
 
-        region = city_region_mapping.get(city)
+        try:
+            s2_path = find_s2_path(s2_root, city)
+            s1_snap_path = find_s1_snap_path(s1_snap_root, city)
+            s1_rtc_path = find_s1_rtc_path(s1_rtc_root, city)
+            label_path_ = find_label_path(label_root, city)
 
-        if not region:
-            if args.allow_unknown_region:
-                region = "UNKNOWN"
-                log("WARN", f"{city}: region is unknown. Writing region as UNKNOWN.")
-            else:
-                fail(
-                    f"No region found for city '{city}'. "
-                    "Provide --city-region-table or use --allow-unknown-region."
+            info, errors = validate_stack_for_city(
+                city=city,
+                s2_path=s2_path,
+                s1_snap_path=s1_snap_path,
+                s1_rtc_path=s1_rtc_path,
+                label_path_=label_path_,
+                expected_s2_bands=int(args.expected_s2_bands),
+                expected_s1_snap_bands=int(args.expected_s1_snap_bands),
+                expected_s1_rtc_bands=int(args.expected_s1_rtc_bands),
+                expected_label_bands=int(args.expected_label_bands),
+                transform_tolerance=float(args.transform_tolerance),
+            )
+
+            if errors:
+                for err in errors:
+                    message = f"{city}: {err}"
+                    validation_failures.append(message)
+                    log("ERROR", message)
+
+                city_summary_rows.append(
+                    {
+                        "city": city,
+                        "region": region,
+                        "status": "failed",
+                        "n_patches": 0,
+                        "width": info.get("width", ""),
+                        "height": info.get("height", ""),
+                        "s2_band_count": info.get("s2_band_count", ""),
+                        "s1_snap_band_count": info.get("s1_snap_band_count", ""),
+                        "s1_rtc_band_count": info.get("s1_rtc_band_count", ""),
+                        "label_band_count": info.get("label_band_count", ""),
+                        "s2_path": path_to_str(s2_path),
+                        "s1_snap_path": path_to_str(s1_snap_path),
+                        "s1_rtc_path": path_to_str(s1_rtc_path),
+                        "label_path": path_to_str(label_path_),
+                        "notes": " | ".join(errors),
+                    }
                 )
+                continue
 
-        files = find_city_files(instance_root, city)
+            patch_rows = build_patch_rows_for_city(
+                city=city,
+                region=region,
+                width=int(info["width"]),
+                height=int(info["height"]),
+                patch_size=int(args.patch_size),
+                stride=int(args.stride),
+                edge_mode=str(args.edge_mode),
+                s2_path=s2_path,
+                s1_snap_path=s1_snap_path,
+                s1_rtc_path=s1_rtc_path,
+                label_path_=label_path_,
+                s2_band_count=int(info["s2_band_count"]),
+                s1_snap_band_count=int(info["s1_snap_band_count"]),
+                s1_rtc_band_count=int(info["s1_rtc_band_count"]),
+                label_band_count=int(info["label_band_count"]),
+            )
 
-        validation = validate_city_stack(
-            city=city,
-            files=files,
-            expected_s2_bands=args.expected_s2_bands,
-            expected_s1_bands=args.expected_s1_bands,
-            expected_label_bands=args.expected_label_bands,
-            transform_tolerance=args.transform_tolerance,
-            require_s1_rtc=args.require_s1_rtc,
-        )
+            all_patch_rows.extend(patch_rows)
 
-        if not validation["ok"]:
-            alignment_problem_records.append(
+            city_summary_rows.append(
                 {
                     "city": city,
-                    "problems": validation["problems"],
+                    "region": region,
+                    "status": "ok",
+                    "n_patches": len(patch_rows),
+                    "width": info["width"],
+                    "height": info["height"],
+                    "s2_band_count": info["s2_band_count"],
+                    "s1_snap_band_count": info["s1_snap_band_count"],
+                    "s1_rtc_band_count": info["s1_rtc_band_count"],
+                    "label_band_count": info["label_band_count"],
+                    "s2_path": path_to_str(s2_path),
+                    "s1_snap_path": path_to_str(s1_snap_path),
+                    "s1_rtc_path": path_to_str(s1_rtc_path),
+                    "label_path": path_to_str(label_path_),
+                    "notes": "",
                 }
             )
 
-            for problem in validation["problems"]:
-                log("ERROR", f"{city}: {problem}")
+            log(
+                "OK",
+                f"{city}: patches={len(patch_rows)}, "
+                f"size={info['width']}x{info['height']}, "
+                f"S2={info['s2_band_count']} bands, "
+                f"SNAP={info['s1_snap_band_count']} bands, "
+                f"RTC={info['s1_rtc_band_count']} bands",
+            )
 
-            continue
+        except Exception as exc:
+            message = f"{city}: {repr(exc)}"
+            validation_failures.append(message)
+            log("ERROR", message)
 
-        raster_height = int(validation["raster_height"])
-        raster_width = int(validation["raster_width"])
+            city_summary_rows.append(
+                {
+                    "city": city,
+                    "region": region,
+                    "status": "failed",
+                    "n_patches": 0,
+                    "width": "",
+                    "height": "",
+                    "s2_band_count": "",
+                    "s1_snap_band_count": "",
+                    "s1_rtc_band_count": "",
+                    "label_band_count": "",
+                    "s2_path": "",
+                    "s1_snap_path": "",
+                    "s1_rtc_path": "",
+                    "label_path": "",
+                    "notes": repr(exc),
+                }
+            )
 
-        city_rows, n_row_windows, n_col_windows = generate_city_patch_rows(
-            city=city,
-            region=region,
-            raster_height=raster_height,
-            raster_width=raster_width,
-            patch_size=args.patch_size,
-            stride=args.stride,
-            edge_mode=args.edge_mode,
-            files=files,
-        )
+    if validation_failures:
+        log("ERROR", "Alignment or band-count validation failed for one or more cities:")
+        for failure in validation_failures:
+            log("ERROR", f"  - {failure}")
+        raise SystemExit(2)
 
-        all_rows.extend(city_rows)
+    if not all_patch_rows:
+        fail("No patch rows were created.")
 
-        city_summary = {
-            "city": city,
-            "region": region,
-            "raster_height": raster_height,
-            "raster_width": raster_width,
-            "n_row_windows": n_row_windows,
-            "n_col_windows": n_col_windows,
-            "n_patches": len(city_rows),
-            "rtc_status": validation["rtc_status"],
-            "crs": validation["crs"],
-            "source_s2_path": path_to_str(files["s2"]),
-            "source_s1_snap_grd_path": path_to_str(files["s1_snap_grd"]),
-            "source_s1_rtc_path": path_to_str(files["s1_rtc"]),
-            "source_label_path": path_to_str(files["label"]),
-        }
-
-        city_summaries.append(city_summary)
-
-        log(
-            "OK",
-            f"{city}: {len(city_rows)} patches "
-            f"({n_row_windows} row windows x {n_col_windows} col windows), "
-            f"raster={raster_height}x{raster_width}, "
-            f"region={region}, "
-            f"RTC={validation['rtc_status']}",
-        )
-
-    if alignment_problem_records:
-        formatted = []
-
-        for record in alignment_problem_records:
-            city = record["city"]
-            problems = "; ".join(record["problems"])
-            formatted.append(f"  - {city}: {problems}")
-
-        fail(
-            "Alignment or band-count validation failed for one or more cities:\n"
-            + "\n".join(formatted)
-        )
-
-    if not all_rows:
-        fail("No patch rows were generated.")
-
-    patch_size = args.patch_size
-    stride = args.stride
-    edge_mode = args.edge_mode
-
-    csv_path = output_dir / f"patch_tiling_index_ps{patch_size}_st{stride}_{edge_mode}.csv"
-    json_path = output_dir / f"patch_tiling_index_ps{patch_size}_st{stride}_{edge_mode}.json"
-    md_path = output_dir / f"patch_tiling_index_ps{patch_size}_st{stride}_{edge_mode}.md"
-
-    patches_by_city = Counter(str(row["city"]) for row in all_rows)
-    patches_by_region = Counter(str(row["region"]) for row in all_rows)
-
-    rtc_present_city_count = sum(
-        1 for item in city_summaries if item["rtc_status"] == "present"
+    summary = build_summary(
+        instance_root=instance_root,
+        s2_root=s2_root,
+        s1_snap_root=s1_snap_root,
+        s1_rtc_root=s1_rtc_root,
+        label_root=label_root,
+        city_region_table=city_region_table,
+        patch_rows=all_patch_rows,
+        city_rows=city_summary_rows,
+        validation_failures=validation_failures,
+        args=args,
+        csv_path=csv_path,
+        json_path=json_path,
+        md_path=md_path,
     )
-    rtc_missing_city_count = len(city_summaries) - rtc_present_city_count
-
-    summary: Dict[str, object] = {
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "instance_root": path_to_str(instance_root),
-        "source_roots": {
-            "s2_filled": path_to_str(s2_root),
-            "s1_ready": path_to_str(s1_root),
-            "labels": path_to_str(label_root),
-            "s1_rtc_ready": path_to_str(rtc_root),
-        },
-        "city_region_table_used": path_to_str(city_region_table_used),
-        "parameters": {
-            "patch_size": patch_size,
-            "stride": stride,
-            "edge_mode": edge_mode,
-            "expected_city_count": args.expected_city_count,
-            "expected_s2_bands": args.expected_s2_bands,
-            "expected_s1_bands": args.expected_s1_bands,
-            "expected_label_bands": args.expected_label_bands,
-            "transform_tolerance": args.transform_tolerance,
-            "require_s1_rtc": bool(args.require_s1_rtc),
-        },
-        "n_cities_indexed": len(city_summaries),
-        "total_patches": len(all_rows),
-        "missing_required_file_count": 0,
-        "alignment_problem_count": len(alignment_problem_records),
-        "rtc_present_city_count": rtc_present_city_count,
-        "rtc_missing_city_count": rtc_missing_city_count,
-        "patches_by_city": dict(sorted(patches_by_city.items())),
-        "patches_by_region": dict(sorted(patches_by_region.items())),
-        "city_summaries": city_summaries,
-        "outputs": {
-            "csv": path_to_str(csv_path),
-            "json": path_to_str(json_path),
-            "markdown": path_to_str(md_path),
-        },
-    }
 
     log("STEP", "Writing outputs.")
 
-    write_csv(csv_path, all_rows, overwrite=args.overwrite)
-    write_json(json_path, summary, overwrite=args.overwrite)
-    write_markdown(md_path, summary, overwrite=args.overwrite)
+    write_csv(csv_path, all_patch_rows, overwrite=bool(args.overwrite))
+    write_json(json_path, summary, overwrite=bool(args.overwrite))
+    write_markdown(md_path, summary, city_summary_rows, overwrite=bool(args.overwrite))
 
     log("OK", f"Wrote CSV:      {path_to_str(csv_path)}")
     log("OK", f"Wrote JSON:     {path_to_str(json_path)}")
     log("OK", f"Wrote Markdown: {path_to_str(md_path)}")
 
     log("STEP", "Final summary.")
-    log("OK", f"Cities indexed: {len(city_summaries)}")
-    log("OK", f"Total patches: {len(all_rows)}")
-    log("OK", "Missing required file count: 0")
-    log("OK", f"Alignment problem count: {len(alignment_problem_records)}")
-    log("OK", f"RTC present cities: {rtc_present_city_count}")
-    log("OK", f"RTC missing cities: {rtc_missing_city_count}")
+    log("OK", f"Cities indexed: {summary['n_cities_indexed']}")
+    log("OK", f"Total patches: {summary['total_patches']}")
+    log("OK", f"Validation failures: {summary['n_validation_failures']}")
 
-    log("INFO", "Patch counts by region:")
-    for region, count in sorted(patches_by_region.items()):
-        log("INFO", f"  {region}: {count}")
-
-    log("INFO", "Top patch counts by city:")
-    for city, count in patches_by_city.most_common(10):
-        log("INFO", f"  {city}: {count}")
+    rtc_available = sum(1 for row in all_patch_rows if row["s1_rtc_exists"])
+    log("OK", f"Patches with S1 RTC available: {rtc_available}")
 
 
 if __name__ == "__main__":
