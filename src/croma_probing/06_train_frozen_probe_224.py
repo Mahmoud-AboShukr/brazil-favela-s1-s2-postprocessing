@@ -130,6 +130,39 @@ def ensure_output_can_be_written(path: Path, overwrite: bool) -> None:
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def slugify_for_filename(value: str) -> str:
+    """
+    Convert a string into a safe filename component.
+    """
+    text = str(value).strip().lower()
+    text = text.replace(" ", "_")
+    text = text.replace("-", "_")
+
+    allowed = []
+    for char in text:
+        if char.isalnum() or char == "_":
+            allowed.append(char)
+        else:
+            allowed.append("_")
+
+    text = "".join(allowed)
+
+    while "__" in text:
+        text = text.replace("__", "_")
+
+    return text.strip("_")
+
+
+def fold_modes_slug(fold_modes: Sequence[str]) -> str:
+    """
+    Build a stable filename slug from the requested fold modes.
+
+    Examples:
+        ["leave_one_region"] -> "leave_one_region"
+        ["leave_one_city"] -> "leave_one_city"
+        ["leave_one_region", "leave_one_city"] -> "leave_one_region__leave_one_city"
+    """
+    return "__".join(slugify_for_filename(x) for x in fold_modes)
 
 def safe_float(value: object, default: float = 0.0) -> float:
     try:
@@ -1071,12 +1104,13 @@ def main() -> None:
     )
 
     stem = f"ps{args.patch_size}_st{args.stride}_{args.edge_mode}"
+    fold_slug = fold_modes_slug(args.fold_modes)
 
-    result_csv = output_dir / f"frozen_probe_results_{stem}.csv"
-    aggregate_csv = output_dir / f"frozen_probe_aggregate_{stem}.csv"
-    comparison_csv = output_dir / f"frozen_probe_rtc_vs_snap_comparison_{stem}.csv"
-    json_path = output_dir / f"frozen_probe_summary_{stem}.json"
-    md_path = output_dir / f"frozen_probe_summary_{stem}.md"
+    result_csv = output_dir / f"frozen_probe_results_{fold_slug}_{stem}.csv"
+    aggregate_csv = output_dir / f"frozen_probe_aggregate_{fold_slug}_{stem}.csv"
+    comparison_csv = output_dir / f"frozen_probe_rtc_vs_snap_comparison_{fold_slug}_{stem}.csv"
+    json_path = output_dir / f"frozen_probe_summary_{fold_slug}_{stem}.json"
+    md_path = output_dir / f"frozen_probe_summary_{fold_slug}_{stem}.md"
 
     output_paths = {
         "result_csv": result_csv,
