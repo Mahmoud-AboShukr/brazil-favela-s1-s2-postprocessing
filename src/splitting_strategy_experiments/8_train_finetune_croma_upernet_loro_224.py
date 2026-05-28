@@ -1000,6 +1000,7 @@ class MetricAccumulator:
         balanced_accuracy = 0.5 * (recall + specificity)
 
         return {
+            "threshold": float(self.threshold),
             "loss": self.loss_sum / max(1, self.n_batches),
             "iou": float(iou),
             "dice": float(dice),
