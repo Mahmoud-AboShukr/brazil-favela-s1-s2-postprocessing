@@ -6,53 +6,31 @@ build_region_balanced_city_splits_224.py
 
 Main objective
 --------------
-Build a simple region-balanced city-level train/validation/test split for the
-next BigEarthNet/reBEN segmentation experiments.
+Build a simple region-balanced train/validation/test split for BigEarthNet/reBEN
+segmentation experiments.
 
-The split design is:
+Updated split design
+--------------------
+The goal is to test learnability, not strict geographic generalization.
 
-    validation: one city from each Brazilian macro-region
-    test:       one different city from each Brazilian macro-region
-    train:      all remaining cities
+Therefore, the training split MUST contain examples from all Brazilian regions.
 
-Why this script exists
-----------------------
-The previous LORO experiments were intentionally strict and exposed strong
-geographic domain shift. Supervisors suggested temporarily pausing LORO and
-testing a simpler split first, to answer:
+For regions with at least 3 cities:
+    test  = one city
+    val   = one different city
+    train = all remaining cities
 
-    Can a pretrained S1+S2 segmentation model learn favela masks at all
-    when the training set contains examples from all regions?
+For regions with exactly 2 cities:
+    test  = one city
+    train = the other city
+    val   = a patch-level subset sampled from the train city
 
-This script creates the split CSV files needed for that experiment.
-
-Expected input
---------------
-By default, the script reads:
-
-    <instance-root>/metadata/croma_probing/croma_comparison_manifest_ps224_st112_cover.csv
-
-and filters it to:
-
-    modality == s2_s1_snap_vv_vh
-
-This gives one row per unique patch with:
-    - optical_path
-    - sar_path
-    - label_path
-    - city
-    - region
-    - row_start
-    - col_start
-    - label statistics
+This is a deliberate compromise. It keeps the test split city-held-out, while
+ensuring the model sees all regions during training.
 
 Expected output
 ---------------
-By default, outputs are written to:
-
-    <instance-root>/metadata/big_earth_net/region_balanced_city_split_ps224_st112_cover/
-
-with:
+<instance-root>/metadata/big_earth_net/region_balanced_city_split_ps224_st112_cover/
 
     city_level_stats.csv
     selected_cities.json
@@ -70,7 +48,11 @@ python src\\big_earth_net\\build_region_balanced_city_splits_224.py `
   --instance-root "D:/post_processing_dataset/dataset_instances/instance_C_s2_nodata_repaired" `
   --target-modality "s2_s1_snap_vv_vh" `
   --patch-size 224 `
-  --selection-strategy highest_positive `
+  --split-design train_region_covered `
+  --city-ranking highest_positive `
+  --val-patch-fraction 0.20 `
+  --min-patch-val-patches 50 `
+  --max-patch-val-patches 250 `
   --overwrite
 """
 
@@ -92,7 +74,7 @@ REGION_ORDER = ["Central-West", "North", "Northeast", "South", "Southeast"]
 
 
 # ---------------------------------------------------------------------
-# Logging and utility helpers
+# Logging and utilities
 # ---------------------------------------------------------------------
 
 def log(level: str, message: str) -> None:
@@ -133,8 +115,9 @@ def ensure_output_dir(path: Path, overwrite: bool) -> None:
         fail(
             "Output directory already exists and is not empty:\n"
             f"{path_to_str(path)}\n\n"
-            "Use --overwrite if you want to replace/update the split outputs."
+            "Use --overwrite if you want to update the split outputs."
         )
+
     path.mkdir(parents=True, exist_ok=True)
 
 
@@ -171,24 +154,6 @@ def normalize_region_name(name: Any) -> str:
     return str(name).strip()
 
 
-def split_manual_city_list(value: Optional[str]) -> List[str]:
-    """
-    Accept city lists separated by semicolon, comma, or pipe.
-
-    Example:
-        --val-cities "belem;recife;brasilia;porto_alegre;rio_de_janeiro"
-    """
-    if value is None:
-        return []
-
-    text = str(value).strip()
-    if not text:
-        return []
-
-    parts = re.split(r"[;,|]+", text)
-    return [normalize_city_name(p) for p in parts if normalize_city_name(p)]
-
-
 def default_manifest_path(instance_root: Path) -> Path:
     return (
         instance_root
@@ -207,8 +172,21 @@ def default_output_dir(instance_root: Path) -> Path:
     )
 
 
+def safe_markdown_table(df: pd.DataFrame, max_rows: Optional[int] = None) -> str:
+    if max_rows is not None:
+        df = df.head(max_rows).copy()
+
+    if df.empty:
+        return "_No rows._"
+
+    try:
+        return df.to_markdown(index=False)
+    except Exception:
+        return "```\n" + df.to_string(index=False) + "\n```"
+
+
 # ---------------------------------------------------------------------
-# Data loading and validation
+# Data loading
 # ---------------------------------------------------------------------
 
 def load_manifest(
@@ -238,6 +216,7 @@ def load_manifest(
     ]
 
     missing = [c for c in required if c not in df.columns]
+
     if missing:
         fail(
             f"Manifest is missing required columns: {missing}\n"
@@ -263,11 +242,10 @@ def load_manifest(
     df["region"] = df["region"].map(normalize_region_name)
 
     df["label_binary"] = pd.to_numeric(df["label_binary"], errors="coerce").fillna(0).astype(int)
-    df["label_positive_pixels"] = (
-        pd.to_numeric(df["label_positive_pixels"], errors="coerce")
-        .fillna(0)
-        .astype(float)
-    )
+    df["label_positive_pixels"] = pd.to_numeric(
+        df["label_positive_pixels"],
+        errors="coerce",
+    ).fillna(0).astype(float)
 
     df["row_start"] = pd.to_numeric(df["row_start"], errors="coerce").fillna(0).astype(int)
     df["col_start"] = pd.to_numeric(df["col_start"], errors="coerce").fillna(0).astype(int)
@@ -275,13 +253,11 @@ def load_manifest(
     duplicate_patch_count = int(df["patch_id"].duplicated().sum())
 
     if duplicate_patch_count > 0:
-        message = (
-            f"Found {duplicate_patch_count:,} duplicated patch_id values after modality filtering."
-        )
+        message = f"Found {duplicate_patch_count:,} duplicated patch_id values after modality filtering."
 
         if allow_duplicate_patch_ids:
             warn(message)
-            warn("Keeping the first row for each duplicated patch_id.")
+            warn("Keeping first occurrence per patch_id.")
             df = df.drop_duplicates(subset=["patch_id"], keep="first").copy()
         else:
             duplicated = (
@@ -289,11 +265,12 @@ def load_manifest(
                 .sort_values("patch_id")
                 .head(20)
             )
+
             fail(
                 message
                 + "\n\nFirst duplicated examples:\n"
                 + duplicated[["patch_id", "city", "region", "modality"]].to_string(index=False)
-                + "\n\nUse --allow-duplicate-patch-ids if you intentionally want to keep first occurrence."
+                + "\n\nUse --allow-duplicate-patch-ids only if this is intentional."
             )
 
     if "optical_path" not in df.columns:
@@ -301,14 +278,6 @@ def load_manifest(
 
     if "sar_path" not in df.columns:
         warn("Column sar_path is missing. Training script may need this later.")
-
-    unknown_regions = sorted([r for r in df["region"].unique().tolist() if r not in REGION_ORDER])
-    if unknown_regions:
-        warn(
-            "Found regions outside expected REGION_ORDER:\n"
-            f"{unknown_regions}\n"
-            "They will still be included, but auto-selection is designed for the five standard regions."
-        )
 
     return df.reset_index(drop=True)
 
@@ -333,27 +302,27 @@ def build_city_level_stats(df: pd.DataFrame, patch_size: int) -> pd.DataFrame:
     )
 
     stats["n_empty_patches"] = stats["n_patches"] - stats["n_positive_patches"]
-    stats["positive_patch_pct"] = (
-        100.0 * stats["n_positive_patches"] / stats["n_patches"].clip(lower=1)
-    )
-
+    stats["positive_patch_pct"] = 100.0 * stats["n_positive_patches"] / stats["n_patches"].clip(lower=1)
     stats["total_pixels"] = stats["n_patches"] * patch_area
     stats["label_positive_percent"] = (
         100.0 * stats["label_positive_pixels"] / stats["total_pixels"].clip(lower=1)
     )
-
     stats["has_positive_pixels"] = stats["label_positive_pixels"] > 0
     stats["has_positive_patches"] = stats["n_positive_patches"] > 0
 
     region_rank = {region: i for i, region in enumerate(REGION_ORDER)}
     stats["_region_order"] = stats["region"].map(region_rank).fillna(999).astype(int)
 
-    stats = stats.sort_values(
-        ["_region_order", "region", "label_positive_pixels", "n_positive_patches", "n_patches"],
-        ascending=[True, True, False, False, False],
-    ).drop(columns=["_region_order"])
+    stats = (
+        stats.sort_values(
+            ["_region_order", "region", "label_positive_pixels", "n_positive_patches", "n_patches"],
+            ascending=[True, True, False, False, False],
+        )
+        .drop(columns=["_region_order"])
+        .reset_index(drop=True)
+    )
 
-    return stats.reset_index(drop=True)
+    return stats
 
 
 def print_city_stats_summary(city_stats: pd.DataFrame) -> None:
@@ -376,289 +345,302 @@ def print_city_stats_summary(city_stats: pd.DataFrame) -> None:
             f"  {row['region']}: "
             f"{int(row['n_cities'])} cities, "
             f"{int(row['n_patches']):,} patches, "
-            f"{int(row['n_positive_patches']):,} positive patches"
+            f"{int(row['n_positive_patches']):,} positive patches, "
+            f"{int(row['label_positive_pixels']):,} positive pixels"
         )
 
 
+def rank_cities(region_df: pd.DataFrame, city_ranking: str) -> pd.DataFrame:
+    if city_ranking == "highest_positive":
+        return region_df.sort_values(
+            ["label_positive_pixels", "n_positive_patches", "n_patches", "city"],
+            ascending=[False, False, False, True],
+        ).reset_index(drop=True)
+
+    if city_ranking == "balanced_positive_percent":
+        return region_df.sort_values(
+            ["label_positive_percent", "n_positive_patches", "n_patches", "city"],
+            ascending=[True, True, True, True],
+        ).reset_index(drop=True)
+
+    if city_ranking == "largest_patch_count":
+        return region_df.sort_values(
+            ["n_patches", "n_positive_patches", "label_positive_pixels", "city"],
+            ascending=[False, False, False, True],
+        ).reset_index(drop=True)
+
+    fail(f"Unsupported city ranking: {city_ranking}")
+
+
 # ---------------------------------------------------------------------
-# City selection
+# Train-region-covered split logic
 # ---------------------------------------------------------------------
 
-def validate_manual_cities(
-    city_stats: pd.DataFrame,
-    val_cities: Sequence[str],
-    test_cities: Sequence[str],
-    expected_regions: Sequence[str],
-) -> Tuple[List[str], List[str]]:
-    val_set = {normalize_city_name(c) for c in val_cities}
-    test_set = {normalize_city_name(c) for c in test_cities}
-
-    if not val_set or not test_set:
-        fail("Both --val-cities and --test-cities must be provided for manual selection.")
-
-    overlap = val_set.intersection(test_set)
-    if overlap:
-        fail(f"Manual val/test city lists overlap: {sorted(overlap)}")
-
-    known_cities = set(city_stats["city"].tolist())
-
-    unknown_val = sorted(val_set - known_cities)
-    unknown_test = sorted(test_set - known_cities)
-
-    if unknown_val:
-        fail(f"Unknown validation cities: {unknown_val}")
-
-    if unknown_test:
-        fail(f"Unknown test cities: {unknown_test}")
-
-    city_to_region = dict(zip(city_stats["city"], city_stats["region"]))
-
-    val_regions = [city_to_region[c] for c in val_set]
-    test_regions = [city_to_region[c] for c in test_set]
-
-    missing_val_regions = sorted(set(expected_regions) - set(val_regions))
-    missing_test_regions = sorted(set(expected_regions) - set(test_regions))
-
-    duplicate_val_regions = sorted([r for r in set(val_regions) if val_regions.count(r) > 1])
-    duplicate_test_regions = sorted([r for r in set(test_regions) if test_regions.count(r) > 1])
-
-    if missing_val_regions:
-        fail(f"Manual validation cities do not cover regions: {missing_val_regions}")
-
-    if missing_test_regions:
-        fail(f"Manual test cities do not cover regions: {missing_test_regions}")
-
-    if duplicate_val_regions:
-        fail(f"Manual validation has more than one city for regions: {duplicate_val_regions}")
-
-    if duplicate_test_regions:
-        fail(f"Manual test has more than one city for regions: {duplicate_test_regions}")
-
-    return sorted(val_set), sorted(test_set)
-
-
-def eligible_cities_for_region(
-    city_stats: pd.DataFrame,
-    region: str,
-    min_patches: int,
-    min_positive_patches: int,
-    min_positive_pixels: float,
-) -> pd.DataFrame:
-    region_df = city_stats[city_stats["region"] == region].copy()
-
-    if region_df.empty:
-        return region_df
-
-    eligible = region_df[
-        (region_df["n_patches"] >= int(min_patches))
-        & (region_df["n_positive_patches"] >= int(min_positive_patches))
-        & (region_df["label_positive_pixels"] >= float(min_positive_pixels))
-    ].copy()
-
-    return eligible
-
-
-def auto_select_cities(
-    city_stats: pd.DataFrame,
-    expected_regions: Sequence[str],
-    min_patches: int,
-    min_positive_patches: int,
-    min_positive_pixels: float,
-    selection_strategy: str,
-) -> Tuple[List[str], List[str], Dict[str, Any]]:
+def stratified_patch_sample(
+    city_df: pd.DataFrame,
+    val_fraction: float,
+    min_val_patches: int,
+    max_val_patches: int,
+    seed: int,
+) -> Set[str]:
     """
-    Select one validation city and one test city per region.
+    Sample validation patches from a train city while preserving approximate
+    positive/empty ratio.
 
-    Strategies:
-      highest_positive:
-        Sort cities by label_positive_pixels descending.
-        Test gets the highest-positive city.
-        Val gets the second-highest-positive city.
-
-      balanced_positive_percent:
-        Sort eligible cities by label_positive_percent.
-        Test gets the city near the upper-middle.
-        Val gets the city near the middle.
-        This avoids always selecting only the most positive cities.
-
-      largest_patch_count:
-        Sort by n_patches descending.
-        Test gets largest city, val gets second largest.
+    This is used only for regions with exactly 2 cities, where we cannot have
+    one train city, one validation city, and one test city simultaneously.
     """
-    selection_strategy = str(selection_strategy)
+    n = len(city_df)
 
-    val_cities: List[str] = []
-    test_cities: List[str] = []
-    details: Dict[str, Any] = {
-        "selection_strategy": selection_strategy,
+    if n < 2:
+        fail("Cannot sample validation patches from a city with fewer than 2 patches.")
+
+    desired = int(round(float(val_fraction) * n))
+    desired = max(int(min_val_patches), desired)
+    desired = min(int(max_val_patches), desired)
+    desired = min(desired, n - 1)
+
+    if desired <= 0:
+        desired = 1
+
+    pos_df = city_df[city_df["label_binary"] == 1]
+    neg_df = city_df[city_df["label_binary"] == 0]
+
+    pos_count = len(pos_df)
+    neg_count = len(neg_df)
+
+    if pos_count == 0 or neg_count == 0:
+        sampled = city_df.sample(n=desired, random_state=seed)
+        return set(sampled["patch_id"].astype(str).tolist())
+
+    pos_ratio = pos_count / n
+    n_pos_val = int(round(desired * pos_ratio))
+    n_pos_val = max(1, n_pos_val)
+    n_pos_val = min(pos_count, n_pos_val)
+
+    n_neg_val = desired - n_pos_val
+    n_neg_val = max(0, n_neg_val)
+    n_neg_val = min(neg_count, n_neg_val)
+
+    # If rounding/capping reduced the total, fill from the remaining pool.
+    selected_parts = []
+
+    selected_pos_ids: Set[str] = set()
+    selected_neg_ids: Set[str] = set()
+
+    if n_pos_val > 0:
+        pos_sample = pos_df.sample(n=n_pos_val, random_state=seed)
+        selected_parts.append(pos_sample)
+        selected_pos_ids = set(pos_sample["patch_id"].astype(str).tolist())
+
+    if n_neg_val > 0:
+        neg_sample = neg_df.sample(n=n_neg_val, random_state=seed + 1)
+        selected_parts.append(neg_sample)
+        selected_neg_ids = set(neg_sample["patch_id"].astype(str).tolist())
+
+    selected = pd.concat(selected_parts, axis=0) if selected_parts else pd.DataFrame()
+
+    if len(selected) < desired:
+        already = selected_pos_ids.union(selected_neg_ids)
+        remaining = city_df[~city_df["patch_id"].astype(str).isin(already)]
+        fill_n = min(desired - len(selected), len(remaining))
+
+        if fill_n > 0:
+            fill_sample = remaining.sample(n=fill_n, random_state=seed + 2)
+            selected = pd.concat([selected, fill_sample], axis=0)
+
+    return set(selected["patch_id"].astype(str).tolist())
+
+
+def build_train_region_covered_split(
+    df: pd.DataFrame,
+    city_stats: pd.DataFrame,
+    city_ranking: str,
+    val_patch_fraction: float,
+    min_patch_val_patches: int,
+    max_patch_val_patches: int,
+    seed: int,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Build split such that train contains all regions.
+
+    For >=3 cities:
+        test city = top-ranked city
+        val city  = second-ranked city
+        train     = rest
+
+    For exactly 2 cities:
+        test city = top-ranked city
+        train city = second-ranked city
+        val patches = sampled from train city
+
+    This creates city-level test everywhere, city-level validation where possible,
+    and patch-level validation only where necessary.
+    """
+    split_df = df.copy()
+    split_df["split"] = "train"
+    split_df["split_assignment_type"] = "train_city"
+    split_df["split_note"] = ""
+
+    selected: Dict[str, Any] = {
+        "split_design": "train_region_covered",
+        "city_ranking": city_ranking,
+        "val_patch_fraction": float(val_patch_fraction),
+        "min_patch_val_patches": int(min_patch_val_patches),
+        "max_patch_val_patches": int(max_patch_val_patches),
+        "seed": int(seed),
         "regions": {},
+        "test_cities": [],
+        "val_city_holdout_cities": [],
+        "patch_val_source_cities": [],
         "warnings": [],
     }
 
-    for region in expected_regions:
-        region_df = city_stats[city_stats["region"] == region].copy()
+    for region in REGION_ORDER:
+        region_city_stats = city_stats[city_stats["region"] == region].copy()
 
-        if region_df.empty:
-            fail(f"No cities found for region: {region}")
+        if region_city_stats.empty:
+            fail(f"No cities found for expected region: {region}")
 
-        eligible = eligible_cities_for_region(
-            city_stats=city_stats,
-            region=region,
-            min_patches=min_patches,
-            min_positive_patches=min_positive_patches,
-            min_positive_pixels=min_positive_pixels,
-        )
+        ranked = rank_cities(region_city_stats, city_ranking=city_ranking)
+        n_cities = len(ranked)
 
-        if len(eligible) < 2:
-            warning = (
-                f"Region {region} has only {len(eligible)} eligible cities using strict filters. "
-                "Relaxing filters for this region."
-            )
-            warn(warning)
-            details["warnings"].append(warning)
-
-            eligible = region_df[
-                (region_df["n_positive_patches"] > 0)
-                | (region_df["label_positive_pixels"] > 0)
-            ].copy()
-
-        if len(eligible) < 2:
-            warning = (
-                f"Region {region} still has fewer than two positive cities. "
-                "Using all cities in the region."
-            )
-            warn(warning)
-            details["warnings"].append(warning)
-            eligible = region_df.copy()
-
-        if len(eligible) < 2:
+        if n_cities < 2:
             fail(
-                f"Region {region} has fewer than two cities. "
-                "Cannot select one validation and one test city."
+                f"Region {region} has only {n_cities} city. "
+                "Cannot create a city-held-out test and train-region-covered split."
             )
 
-        if selection_strategy == "highest_positive":
-            ranked = eligible.sort_values(
-                ["label_positive_pixels", "n_positive_patches", "n_patches", "city"],
-                ascending=[False, False, False, True],
-            ).reset_index(drop=True)
-
-            test_city = str(ranked.iloc[0]["city"])
-            val_city = str(ranked.iloc[1]["city"])
-
-        elif selection_strategy == "balanced_positive_percent":
-            ranked = eligible.sort_values(
-                ["label_positive_percent", "n_positive_patches", "n_patches", "city"],
-                ascending=[True, True, True, True],
-            ).reset_index(drop=True)
-
-            n = len(ranked)
-            val_idx = max(0, min(n - 1, int(round(0.50 * (n - 1)))))
-            test_idx = max(0, min(n - 1, int(round(0.75 * (n - 1)))))
+        # For highest_positive/largest_patch_count, top row is strongest/largest.
+        # For balanced_positive_percent, rank_cities returns low-to-high.
+        # For balanced mode, choose test from upper-middle and val/train from middle.
+        if city_ranking == "balanced_positive_percent" and n_cities >= 3:
+            test_idx = max(0, min(n_cities - 1, int(round(0.75 * (n_cities - 1)))))
+            val_idx = max(0, min(n_cities - 1, int(round(0.50 * (n_cities - 1)))))
 
             if test_idx == val_idx:
-                test_idx = min(n - 1, val_idx + 1)
+                test_idx = min(n_cities - 1, val_idx + 1)
 
-            val_city = str(ranked.iloc[val_idx]["city"])
             test_city = str(ranked.iloc[test_idx]["city"])
+            val_city = str(ranked.iloc[val_idx]["city"])
 
-        elif selection_strategy == "largest_patch_count":
-            ranked = eligible.sort_values(
-                ["n_patches", "n_positive_patches", "label_positive_pixels", "city"],
-                ascending=[False, False, False, True],
-            ).reset_index(drop=True)
-
+        else:
             test_city = str(ranked.iloc[0]["city"])
             val_city = str(ranked.iloc[1]["city"])
 
+        selected["test_cities"].append(test_city)
+
+        split_df.loc[split_df["city"] == test_city, "split"] = "test"
+        split_df.loc[split_df["city"] == test_city, "split_assignment_type"] = "test_city_holdout"
+        split_df.loc[split_df["city"] == test_city, "split_note"] = f"{region}: city-held-out test"
+
+        if n_cities >= 3:
+            selected["val_city_holdout_cities"].append(val_city)
+
+            split_df.loc[split_df["city"] == val_city, "split"] = "val"
+            split_df.loc[split_df["city"] == val_city, "split_assignment_type"] = "val_city_holdout"
+            split_df.loc[split_df["city"] == val_city, "split_note"] = f"{region}: city-held-out validation"
+
+            train_cities = [
+                str(c)
+                for c in ranked["city"].tolist()
+                if str(c) not in {test_city, val_city}
+            ]
+
+            selected["regions"][region] = {
+                "n_cities": int(n_cities),
+                "mode": "city_val_and_city_test",
+                "test_city": test_city,
+                "val_city": val_city,
+                "train_cities": train_cities,
+                "ranked_cities": ranked[
+                    [
+                        "city",
+                        "n_patches",
+                        "n_positive_patches",
+                        "positive_patch_pct",
+                        "label_positive_pixels",
+                        "label_positive_percent",
+                    ]
+                ].to_dict(orient="records"),
+            }
+
         else:
-            fail(
-                f"Unsupported selection strategy: {selection_strategy}. "
-                "Use highest_positive, balanced_positive_percent, or largest_patch_count."
+            # Exactly 2 cities: keep second city in train, sample validation patches from it.
+            train_val_city = val_city
+            selected["patch_val_source_cities"].append(train_val_city)
+
+            source_df = split_df[
+                (split_df["region"] == region)
+                & (split_df["city"] == train_val_city)
+                & (split_df["split"] == "train")
+            ].copy()
+
+            val_patch_ids = stratified_patch_sample(
+                city_df=source_df,
+                val_fraction=float(val_patch_fraction),
+                min_val_patches=int(min_patch_val_patches),
+                max_val_patches=int(max_patch_val_patches),
+                seed=int(seed) + len(selected["patch_val_source_cities"]) * 100,
             )
 
-        if val_city == test_city:
-            fail(f"Auto-selection selected the same city for val/test in region {region}: {val_city}")
+            patch_mask = split_df["patch_id"].astype(str).isin(val_patch_ids)
 
-        val_cities.append(val_city)
-        test_cities.append(test_city)
+            split_df.loc[patch_mask, "split"] = "val"
+            split_df.loc[patch_mask, "split_assignment_type"] = "val_patch_sample_from_train_city"
+            split_df.loc[patch_mask, "split_note"] = (
+                f"{region}: patch-level validation sampled from train city {train_val_city} "
+                "to preserve train region coverage"
+            )
 
-        details["regions"][region] = {
-            "n_region_cities": int(len(region_df)),
-            "n_eligible_cities": int(len(eligible)),
-            "selected_val_city": val_city,
-            "selected_test_city": test_city,
-            "eligible_cities_ranked": ranked[
-                [
-                    "city",
-                    "n_patches",
-                    "n_positive_patches",
-                    "positive_patch_pct",
-                    "label_positive_pixels",
-                    "label_positive_percent",
-                ]
-            ].to_dict(orient="records"),
-        }
+            train_patch_count_after = int(
+                len(
+                    split_df[
+                        (split_df["region"] == region)
+                        & (split_df["city"] == train_val_city)
+                        & (split_df["split"] == "train")
+                    ]
+                )
+            )
 
-    return val_cities, test_cities, details
+            selected["regions"][region] = {
+                "n_cities": int(n_cities),
+                "mode": "city_test_patch_val_train_region_covered",
+                "test_city": test_city,
+                "patch_val_source_city": train_val_city,
+                "patch_val_count": int(len(val_patch_ids)),
+                "train_patch_count_remaining_in_source_city": train_patch_count_after,
+                "ranked_cities": ranked[
+                    [
+                        "city",
+                        "n_patches",
+                        "n_positive_patches",
+                        "positive_patch_pct",
+                        "label_positive_pixels",
+                        "label_positive_percent",
+                    ]
+                ].to_dict(orient="records"),
+            }
+
+            warning = (
+                f"Region {region} has only 2 cities. "
+                f"Using {test_city} as city-held-out test and sampling validation patches "
+                f"from train city {train_val_city}."
+            )
+            warn(warning)
+            selected["warnings"].append(warning)
+
+    return split_df, selected
 
 
 # ---------------------------------------------------------------------
-# Split creation and validation
+# Validation and summaries
 # ---------------------------------------------------------------------
-
-def assign_splits(
-    df: pd.DataFrame,
-    val_cities: Sequence[str],
-    test_cities: Sequence[str],
-) -> pd.DataFrame:
-    val_set = {normalize_city_name(c) for c in val_cities}
-    test_set = {normalize_city_name(c) for c in test_cities}
-
-    overlap = val_set.intersection(test_set)
-    if overlap:
-        fail(f"Validation and test cities overlap: {sorted(overlap)}")
-
-    out = df.copy()
-    out["split"] = "train"
-    out.loc[out["city"].isin(val_set), "split"] = "val"
-    out.loc[out["city"].isin(test_set), "split"] = "test"
-
-    return out
-
 
 def validate_split(df: pd.DataFrame) -> Dict[str, Any]:
     split_names = ["train", "val", "test"]
 
-    split_city_sets = {
-        split: set(df[df["split"] == split]["city"].unique().tolist())
-        for split in split_names
-    }
-
-    split_patch_sets = {
-        split: set(df[df["split"] == split]["patch_id"].unique().tolist())
-        for split in split_names
-    }
-
     problems: List[str] = []
-
-    for a in split_names:
-        for b in split_names:
-            if a >= b:
-                continue
-
-            city_overlap = split_city_sets[a].intersection(split_city_sets[b])
-            patch_overlap = split_patch_sets[a].intersection(split_patch_sets[b])
-
-            if city_overlap:
-                problems.append(f"City leakage between {a} and {b}: {sorted(city_overlap)}")
-
-            if patch_overlap:
-                examples = sorted(list(patch_overlap))[:10]
-                problems.append(
-                    f"Patch leakage between {a} and {b}: {len(patch_overlap)} examples. "
-                    f"First examples: {examples}"
-                )
 
     split_counts = df["split"].value_counts().to_dict()
 
@@ -666,18 +648,84 @@ def validate_split(df: pd.DataFrame) -> Dict[str, Any]:
         if split_counts.get(split, 0) == 0:
             problems.append(f"Split {split} is empty.")
 
+    split_region_sets = {
+        split: set(df[df["split"] == split]["region"].unique().tolist())
+        for split in split_names
+    }
+
+    for split in split_names:
+        missing = sorted(set(REGION_ORDER) - split_region_sets[split])
+        if missing:
+            problems.append(f"Split {split} is missing regions: {missing}")
+
+    split_patch_sets = {
+        split: set(df[df["split"] == split]["patch_id"].astype(str).unique().tolist())
+        for split in split_names
+    }
+
+    for i, a in enumerate(split_names):
+        for b in split_names[i + 1:]:
+            overlap = split_patch_sets[a].intersection(split_patch_sets[b])
+            if overlap:
+                problems.append(
+                    f"Patch leakage between {a} and {b}: {len(overlap)}. "
+                    f"First examples: {sorted(list(overlap))[:10]}"
+                )
+
+    # Test cities must be fully held out from train and val.
+    test_cities = set(df[df["split"] == "test"]["city"].unique().tolist())
+    train_cities = set(df[df["split"] == "train"]["city"].unique().tolist())
+    val_cities = set(df[df["split"] == "val"]["city"].unique().tolist())
+
+    test_train_overlap = sorted(test_cities.intersection(train_cities))
+    test_val_overlap = sorted(test_cities.intersection(val_cities))
+
+    if test_train_overlap:
+        problems.append(f"Test cities also appear in train: {test_train_overlap}")
+
+    if test_val_overlap:
+        problems.append(f"Test cities also appear in val: {test_val_overlap}")
+
+    # Train/val city overlap is allowed only for patch-level validation source cities.
+    train_val_overlap = sorted(train_cities.intersection(val_cities))
+
+    allowed_train_val_overlap = sorted(
+        df[df["split_assignment_type"] == "val_patch_sample_from_train_city"]["city"]
+        .unique()
+        .tolist()
+    )
+
+    unexpected_train_val_overlap = sorted(set(train_val_overlap) - set(allowed_train_val_overlap))
+
+    if unexpected_train_val_overlap:
+        problems.append(
+            "Unexpected train/val city overlap outside patch-level validation source cities: "
+            f"{unexpected_train_val_overlap}"
+        )
+
     if problems:
         fail("Split validation failed:\n" + "\n".join(f"- {p}" for p in problems))
 
     return {
         "status": "ok",
         "split_patch_counts": {k: int(v) for k, v in split_counts.items()},
-        "split_city_counts": {
-            split: int(len(cities))
-            for split, cities in split_city_sets.items()
+        "split_region_counts": {
+            split: int(len(split_region_sets[split]))
+            for split in split_names
         },
-        "city_overlap": "none",
+        "split_regions": {
+            split: sorted(split_region_sets[split])
+            for split in split_names
+        },
+        "test_city_overlap_with_train_or_val": "none",
+        "train_val_city_overlap": train_val_overlap,
+        "allowed_train_val_city_overlap": allowed_train_val_overlap,
         "patch_overlap": "none",
+        "interpretation": (
+            "Train/val city overlap is allowed only for regions with two cities, "
+            "where validation patches are sampled from the remaining train city to "
+            "preserve train-region coverage."
+        ),
     }
 
 
@@ -697,9 +745,7 @@ def build_split_patch_summary(df: pd.DataFrame, patch_size: int) -> pd.DataFrame
     )
 
     summary["n_empty_patches"] = summary["n_patches"] - summary["n_positive_patches"]
-    summary["positive_patch_pct"] = (
-        100.0 * summary["n_positive_patches"] / summary["n_patches"].clip(lower=1)
-    )
+    summary["positive_patch_pct"] = 100.0 * summary["n_positive_patches"] / summary["n_patches"].clip(lower=1)
     summary["total_pixels"] = summary["n_patches"] * patch_area
     summary["label_positive_percent"] = (
         100.0 * summary["label_positive_pixels"] / summary["total_pixels"].clip(lower=1)
@@ -707,16 +753,15 @@ def build_split_patch_summary(df: pd.DataFrame, patch_size: int) -> pd.DataFrame
 
     split_order = {"train": 0, "val": 1, "test": 2}
     summary["_order"] = summary["split"].map(split_order).fillna(99).astype(int)
-    summary = summary.sort_values("_order").drop(columns=["_order"])
 
-    return summary.reset_index(drop=True)
+    return summary.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
 
 
 def build_split_city_summary(df: pd.DataFrame, patch_size: int) -> pd.DataFrame:
     patch_area = int(patch_size) * int(patch_size)
 
     summary = (
-        df.groupby(["split", "region", "city"])
+        df.groupby(["split", "region", "city", "split_assignment_type"])
         .agg(
             n_patches=("patch_id", "count"),
             n_positive_patches=("label_binary", "sum"),
@@ -725,9 +770,7 @@ def build_split_city_summary(df: pd.DataFrame, patch_size: int) -> pd.DataFrame:
         .reset_index()
     )
 
-    summary["positive_patch_pct"] = (
-        100.0 * summary["n_positive_patches"] / summary["n_patches"].clip(lower=1)
-    )
+    summary["positive_patch_pct"] = 100.0 * summary["n_positive_patches"] / summary["n_patches"].clip(lower=1)
     summary["total_pixels"] = summary["n_patches"] * patch_area
     summary["label_positive_percent"] = (
         100.0 * summary["label_positive_pixels"] / summary["total_pixels"].clip(lower=1)
@@ -739,81 +782,119 @@ def build_split_city_summary(df: pd.DataFrame, patch_size: int) -> pd.DataFrame:
     summary["_split_order"] = summary["split"].map(split_order).fillna(99).astype(int)
     summary["_region_order"] = summary["region"].map(region_order).fillna(999).astype(int)
 
-    summary = summary.sort_values(
-        ["_split_order", "_region_order", "region", "city"]
-    ).drop(columns=["_split_order", "_region_order"])
+    return (
+        summary.sort_values(["_split_order", "_region_order", "region", "city"])
+        .drop(columns=["_split_order", "_region_order"])
+        .reset_index(drop=True)
+    )
 
-    return summary.reset_index(drop=True)
 
+def build_selected_city_summary(city_stats: pd.DataFrame, selected: Dict[str, Any]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
 
-def build_selected_city_summary(
-    city_stats: pd.DataFrame,
-    val_cities: Sequence[str],
-    test_cities: Sequence[str],
-) -> pd.DataFrame:
-    val_set = set(val_cities)
-    test_set = set(test_cities)
+    for region, info in selected["regions"].items():
+        test_city = info["test_city"]
 
-    selected = city_stats[city_stats["city"].isin(val_set.union(test_set))].copy()
+        rows.append(
+            {
+                "selected_role": "test_city_holdout",
+                "region": region,
+                "city": test_city,
+                "mode": info["mode"],
+            }
+        )
 
-    selected["selected_split"] = "unknown"
-    selected.loc[selected["city"].isin(val_set), "selected_split"] = "val"
-    selected.loc[selected["city"].isin(test_set), "selected_split"] = "test"
+        if "val_city" in info:
+            rows.append(
+                {
+                    "selected_role": "val_city_holdout",
+                    "region": region,
+                    "city": info["val_city"],
+                    "mode": info["mode"],
+                }
+            )
 
-    split_order = {"val": 0, "test": 1}
+        if "patch_val_source_city" in info:
+            rows.append(
+                {
+                    "selected_role": "patch_val_source_train_city",
+                    "region": region,
+                    "city": info["patch_val_source_city"],
+                    "mode": info["mode"],
+                }
+            )
+
+    selected_df = pd.DataFrame(rows)
+
+    out = selected_df.merge(
+        city_stats,
+        on=["region", "city"],
+        how="left",
+    )
+
     region_order = {region: i for i, region in enumerate(REGION_ORDER)}
+    role_order = {
+        "test_city_holdout": 0,
+        "val_city_holdout": 1,
+        "patch_val_source_train_city": 2,
+    }
 
-    selected["_split_order"] = selected["selected_split"].map(split_order).fillna(99).astype(int)
-    selected["_region_order"] = selected["region"].map(region_order).fillna(999).astype(int)
+    out["_region_order"] = out["region"].map(region_order).fillna(999).astype(int)
+    out["_role_order"] = out["selected_role"].map(role_order).fillna(999).astype(int)
 
-    selected = selected.sort_values(
-        ["_region_order", "selected_split", "city"]
-    ).drop(columns=["_split_order", "_region_order"])
-
-    return selected.reset_index(drop=True)
+    return (
+        out.sort_values(["_region_order", "_role_order", "city"])
+        .drop(columns=["_region_order", "_role_order"])
+        .reset_index(drop=True)
+    )
 
 
 # ---------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------
 
-def markdown_table(df: pd.DataFrame, max_rows: Optional[int] = None) -> str:
-    if max_rows is not None:
-        df = df.head(max_rows).copy()
-
-    if df.empty:
-        return "_No rows._"
-
-    return df.to_markdown(index=False)
-
-
 def write_split_report(
     path: Path,
     args: argparse.Namespace,
     manifest_path: Path,
     output_dir: Path,
-    city_stats: pd.DataFrame,
     selected_city_summary: pd.DataFrame,
     split_patch_summary: pd.DataFrame,
     split_city_summary: pd.DataFrame,
     validation: Dict[str, Any],
-    selection_details: Dict[str, Any],
+    selected: Dict[str, Any],
 ) -> None:
     lines: List[str] = []
 
-    lines.append("# Region-Balanced City Split Report")
+    lines.append("# Region-Balanced Train-Covered City Split Report")
     lines.append("")
     lines.append(f"Created UTC: `{now_utc()}`")
     lines.append("")
     lines.append("## Objective")
     lines.append("")
     lines.append(
-        "Create a simpler city-level split for the BigEarthNet/reBEN segmentation experiments. "
-        "Validation and test each contain one city from every Brazilian macro-region, while "
-        "the training split contains all remaining cities."
+        "Create a simpler split for BigEarthNet/reBEN segmentation experiments. "
+        "The main constraint is that the training split must contain examples from all five Brazilian regions."
     )
     lines.append("")
-    lines.append("This split is less strict than Leave-One-Region-Out because all regions remain represented in training.")
+    lines.append("## Split Design")
+    lines.append("")
+    lines.append("For regions with at least three cities:")
+    lines.append("")
+    lines.append("- one city is held out for test;")
+    lines.append("- one different city is held out for validation;")
+    lines.append("- all remaining cities stay in training.")
+    lines.append("")
+    lines.append("For regions with exactly two cities:")
+    lines.append("")
+    lines.append("- one city is held out for test;")
+    lines.append("- the other city remains in training;")
+    lines.append("- validation patches are sampled from that train city.")
+    lines.append("")
+    lines.append(
+        "This means validation is not purely city-held-out for two-city regions, "
+        "but this is intentional because the current goal is learnability testing, not strict geographic generalization."
+    )
     lines.append("")
     lines.append("## Configuration")
     lines.append("")
@@ -822,22 +903,23 @@ def write_split_report(
     lines.append(f"- Output directory: `{path_to_str(output_dir)}`")
     lines.append(f"- Target modality: `{args.target_modality}`")
     lines.append(f"- Patch size: `{args.patch_size}`")
-    lines.append(f"- Selection strategy: `{args.selection_strategy}`")
-    lines.append(f"- Minimum patches per selected city: `{args.min_patches}`")
-    lines.append(f"- Minimum positive patches per selected city: `{args.min_positive_patches}`")
-    lines.append(f"- Minimum positive pixels per selected city: `{args.min_positive_pixels}`")
+    lines.append(f"- Split design: `{args.split_design}`")
+    lines.append(f"- City ranking: `{args.city_ranking}`")
+    lines.append(f"- Validation patch fraction for two-city regions: `{args.val_patch_fraction}`")
+    lines.append(f"- Minimum patch-level validation patches: `{args.min_patch_val_patches}`")
+    lines.append(f"- Maximum patch-level validation patches: `{args.max_patch_val_patches}`")
     lines.append("")
     lines.append("## Selected Cities")
     lines.append("")
-    lines.append(markdown_table(selected_city_summary))
+    lines.append(safe_markdown_table(selected_city_summary))
     lines.append("")
     lines.append("## Split-Level Summary")
     lines.append("")
-    lines.append(markdown_table(split_patch_summary))
+    lines.append(safe_markdown_table(split_patch_summary))
     lines.append("")
-    lines.append("## City-Level Split Summary")
+    lines.append("## Split-City Summary")
     lines.append("")
-    lines.append(markdown_table(split_city_summary))
+    lines.append(safe_markdown_table(split_city_summary))
     lines.append("")
     lines.append("## Validation")
     lines.append("")
@@ -848,18 +930,17 @@ def write_split_report(
     lines.append("## Selection Details")
     lines.append("")
     lines.append("```json")
-    lines.append(json.dumps(jsonable(selection_details), indent=2, ensure_ascii=False)[:12000])
+    lines.append(json.dumps(jsonable(selected), indent=2, ensure_ascii=False)[:20000])
     lines.append("```")
     lines.append("")
     lines.append("## Interpretation")
     lines.append("")
     lines.append(
-        "This split is intended for learnability testing. If a BigEarthNet/reBEN-pretrained "
-        "segmentation model performs well under this split, but poorly under LORO, then the "
-        "dataset likely contains learnable signal and the LORO difficulty is mainly due to "
-        "geographic domain shift. If performance is poor even under this easier split, then "
-        "the issue may be deeper, involving labels, normalization, class imbalance, alignment, "
-        "model architecture, or input modality handling."
+        "This split should be used for the next learnability experiment. "
+        "If the BigEarthNet/reBEN model performs reasonably here but poorly under LORO, "
+        "then the dataset contains learnable signal and the LORO difficulty is likely caused by geographic domain shift. "
+        "If performance remains poor even here, then the issue may be related to labels, alignment, normalization, "
+        "class imbalance, model architecture, or input modality handling."
     )
 
     ensure_dir(path.parent)
@@ -875,13 +956,17 @@ def run(args: argparse.Namespace) -> None:
     manifest_path = Path(args.manifest_path) if args.manifest_path else default_manifest_path(instance_root)
     output_dir = Path(args.output_dir) if args.output_dir else default_output_dir(instance_root)
 
-    banner("Build region-balanced city split for BigEarthNet/reBEN experiments")
+    banner("Build train-region-covered city split for BigEarthNet/reBEN experiments")
 
     log("INFO", f"Instance root:      {path_to_str(instance_root)}")
     log("INFO", f"Manifest path:      {path_to_str(manifest_path)}")
     log("INFO", f"Output directory:   {path_to_str(output_dir)}")
     log("INFO", f"Target modality:    {args.target_modality}")
-    log("INFO", f"Selection strategy: {args.selection_strategy}")
+    log("INFO", f"Split design:       {args.split_design}")
+    log("INFO", f"City ranking:       {args.city_ranking}")
+
+    if args.split_design != "train_region_covered":
+        fail("This updated script currently supports only --split-design train_region_covered.")
 
     ensure_output_dir(output_dir, overwrite=bool(args.overwrite))
 
@@ -891,59 +976,28 @@ def run(args: argparse.Namespace) -> None:
         allow_duplicate_patch_ids=bool(args.allow_duplicate_patch_ids),
     )
 
-    city_stats = build_city_level_stats(df, patch_size=int(args.patch_size))
+    city_stats = build_city_level_stats(
+        df=df,
+        patch_size=int(args.patch_size),
+    )
+
     print_city_stats_summary(city_stats)
 
-    city_stats_path = output_dir / "city_level_stats.csv"
-    city_stats.to_csv(city_stats_path, index=False)
-
-    expected_regions = REGION_ORDER
-
-    manual_val_cities = split_manual_city_list(args.val_cities)
-    manual_test_cities = split_manual_city_list(args.test_cities)
-
-    if manual_val_cities or manual_test_cities:
-        log("INFO", "Using manual city selection.")
-        val_cities, test_cities = validate_manual_cities(
-            city_stats=city_stats,
-            val_cities=manual_val_cities,
-            test_cities=manual_test_cities,
-            expected_regions=expected_regions,
-        )
-
-        selection_details = {
-            "mode": "manual",
-            "val_cities": val_cities,
-            "test_cities": test_cities,
-        }
-
-    else:
-        log("INFO", "Using automatic city selection.")
-        val_cities, test_cities, selection_details = auto_select_cities(
-            city_stats=city_stats,
-            expected_regions=expected_regions,
-            min_patches=int(args.min_patches),
-            min_positive_patches=int(args.min_positive_patches),
-            min_positive_pixels=float(args.min_positive_pixels),
-            selection_strategy=str(args.selection_strategy),
-        )
-        selection_details["mode"] = "automatic"
-
-    log("INFO", f"Selected validation cities: {val_cities}")
-    log("INFO", f"Selected test cities:       {test_cities}")
-
-    split_df = assign_splits(
+    split_df, selected = build_train_region_covered_split(
         df=df,
-        val_cities=val_cities,
-        test_cities=test_cities,
+        city_stats=city_stats,
+        city_ranking=str(args.city_ranking),
+        val_patch_fraction=float(args.val_patch_fraction),
+        min_patch_val_patches=int(args.min_patch_val_patches),
+        max_patch_val_patches=int(args.max_patch_val_patches),
+        seed=int(args.seed),
     )
 
     validation = validate_split(split_df)
 
     selected_city_summary = build_selected_city_summary(
         city_stats=city_stats,
-        val_cities=val_cities,
-        test_cities=test_cities,
+        selected=selected,
     )
 
     split_patch_summary = build_split_patch_summary(
@@ -956,36 +1010,35 @@ def run(args: argparse.Namespace) -> None:
         patch_size=int(args.patch_size),
     )
 
-    train_df = split_df[split_df["split"] == "train"].copy()
-    val_df = split_df[split_df["split"] == "val"].copy()
-    test_df = split_df[split_df["split"] == "test"].copy()
-
-    train_path = output_dir / "train.csv"
-    val_path = output_dir / "val.csv"
-    test_path = output_dir / "test.csv"
-
+    city_stats_path = output_dir / "city_level_stats.csv"
+    selected_json_path = output_dir / "selected_cities.json"
     selected_city_summary_path = output_dir / "selected_city_summary.csv"
     split_patch_summary_path = output_dir / "split_patch_summary.csv"
     split_city_summary_path = output_dir / "split_city_summary.csv"
+    train_path = output_dir / "train.csv"
+    val_path = output_dir / "val.csv"
+    test_path = output_dir / "test.csv"
+    report_path = output_dir / "split_report.md"
 
-    train_df.to_csv(train_path, index=False)
-    val_df.to_csv(val_path, index=False)
-    test_df.to_csv(test_path, index=False)
+    city_stats.to_csv(city_stats_path, index=False)
     selected_city_summary.to_csv(selected_city_summary_path, index=False)
     split_patch_summary.to_csv(split_patch_summary_path, index=False)
     split_city_summary.to_csv(split_city_summary_path, index=False)
 
-    selected_payload = {
+    split_df[split_df["split"] == "train"].to_csv(train_path, index=False)
+    split_df[split_df["split"] == "val"].to_csv(val_path, index=False)
+    split_df[split_df["split"] == "test"].to_csv(test_path, index=False)
+
+    payload = {
         "created_utc": now_utc(),
         "instance_root": path_to_str(instance_root),
         "manifest_path": path_to_str(manifest_path),
         "output_dir": path_to_str(output_dir),
         "target_modality": str(args.target_modality),
         "patch_size": int(args.patch_size),
-        "val_cities": val_cities,
-        "test_cities": test_cities,
-        "train_cities": sorted(train_df["city"].unique().tolist()),
-        "selection_details": selection_details,
+        "split_design": str(args.split_design),
+        "city_ranking": str(args.city_ranking),
+        "selection": selected,
         "validation": validation,
         "outputs": {
             "city_level_stats_csv": path_to_str(city_stats_path),
@@ -995,24 +1048,22 @@ def run(args: argparse.Namespace) -> None:
             "train_csv": path_to_str(train_path),
             "val_csv": path_to_str(val_path),
             "test_csv": path_to_str(test_path),
+            "report_md": path_to_str(report_path),
         },
     }
 
-    selected_json_path = output_dir / "selected_cities.json"
-    write_json(selected_json_path, selected_payload)
+    write_json(selected_json_path, payload)
 
-    report_path = output_dir / "split_report.md"
     write_split_report(
         path=report_path,
         args=args,
         manifest_path=manifest_path,
         output_dir=output_dir,
-        city_stats=city_stats,
         selected_city_summary=selected_city_summary,
         split_patch_summary=split_patch_summary,
         split_city_summary=split_city_summary,
         validation=validation,
-        selection_details=selection_details,
+        selected=selected,
     )
 
     banner("Completed")
@@ -1030,13 +1081,14 @@ def run(args: argparse.Namespace) -> None:
     log("INFO", "Split-level summary:")
     print(split_patch_summary.to_string(index=False), flush=True)
 
-    log("INFO", "Selected cities:")
+    log("INFO", "Selected cities / roles:")
     print(
         selected_city_summary[
             [
-                "selected_split",
+                "selected_role",
                 "region",
                 "city",
+                "mode",
                 "n_patches",
                 "n_positive_patches",
                 "positive_patch_pct",
@@ -1046,91 +1098,84 @@ def run(args: argparse.Namespace) -> None:
         flush=True,
     )
 
+    log("INFO", "Validation:")
+    print(json.dumps(jsonable(validation), indent=2, ensure_ascii=False), flush=True)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build region-balanced city train/val/test splits for BigEarthNet/reBEN favela segmentation experiments."
+        description="Build train-region-covered splits for BigEarthNet/reBEN favela segmentation experiments."
     )
 
     parser.add_argument(
         "--instance-root",
         required=True,
-        help="Dataset instance root, e.g. D:/post_processing_dataset/dataset_instances/instance_C_s2_nodata_repaired",
+        help="Dataset instance root.",
     )
     parser.add_argument(
         "--manifest-path",
         default=None,
-        help="Optional explicit manifest path. Default: instance-root/metadata/croma_probing/croma_comparison_manifest_ps224_st112_cover.csv",
+        help="Optional explicit manifest path.",
     )
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="Optional explicit output directory. Default: instance-root/metadata/big_earth_net/region_balanced_city_split_ps224_st112_cover",
+        help="Optional explicit output directory.",
     )
     parser.add_argument(
         "--target-modality",
         default="s2_s1_snap_vv_vh",
-        help="Manifest modality to use. Default: s2_s1_snap_vv_vh",
+        help="Manifest modality to use.",
     )
     parser.add_argument(
         "--patch-size",
         type=int,
         default=224,
-        help="Patch size used for positive pixel percentage calculations.",
+        help="Patch size.",
     )
 
     parser.add_argument(
-        "--selection-strategy",
+        "--split-design",
+        choices=["train_region_covered"],
+        default="train_region_covered",
+        help="Split design. Current supported value: train_region_covered.",
+    )
+    parser.add_argument(
+        "--city-ranking",
         choices=["highest_positive", "balanced_positive_percent", "largest_patch_count"],
         default="highest_positive",
-        help=(
-            "Automatic city selection strategy. "
-            "highest_positive selects the two cities with most positive pixels per region. "
-            "balanced_positive_percent selects middle/upper density cities. "
-            "largest_patch_count selects largest patch-count cities."
-        ),
+        help="How to rank candidate cities inside each region.",
     )
 
     parser.add_argument(
-        "--min-patches",
-        type=int,
-        default=10,
-        help="Minimum number of patches for a city to be eligible for automatic val/test selection.",
-    )
-    parser.add_argument(
-        "--min-positive-patches",
-        type=int,
-        default=1,
-        help="Minimum number of positive patches for a city to be eligible for automatic val/test selection.",
-    )
-    parser.add_argument(
-        "--min-positive-pixels",
+        "--val-patch-fraction",
         type=float,
-        default=1.0,
-        help="Minimum number of positive pixels for a city to be eligible for automatic val/test selection.",
+        default=0.20,
+        help="Fraction of patches sampled for validation from train city in two-city regions.",
+    )
+    parser.add_argument(
+        "--min-patch-val-patches",
+        type=int,
+        default=50,
+        help="Minimum number of patch-level validation patches for two-city regions.",
+    )
+    parser.add_argument(
+        "--max-patch-val-patches",
+        type=int,
+        default=250,
+        help="Maximum number of patch-level validation patches for two-city regions.",
     )
 
     parser.add_argument(
-        "--val-cities",
-        default=None,
-        help=(
-            "Manual validation city list separated by semicolon/comma/pipe. "
-            "Must contain exactly one city per region if provided."
-        ),
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for patch-level validation sampling.",
     )
-    parser.add_argument(
-        "--test-cities",
-        default=None,
-        help=(
-            "Manual test city list separated by semicolon/comma/pipe. "
-            "Must contain exactly one city per region if provided."
-        ),
-    )
-
     parser.add_argument(
         "--allow-duplicate-patch-ids",
         action="store_true",
-        help="If duplicate patch_id values exist after modality filtering, keep the first occurrence instead of failing.",
+        help="If duplicate patch_id values exist after modality filtering, keep first occurrence.",
     )
     parser.add_argument(
         "--overwrite",
