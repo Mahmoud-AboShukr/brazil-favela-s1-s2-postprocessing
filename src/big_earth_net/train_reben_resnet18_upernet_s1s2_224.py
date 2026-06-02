@@ -312,6 +312,211 @@ def default_output_root(instance_root: Path) -> Path:
         / "reben_resnet18_upernet_s1s2_train_region_covered_ps224"
     )
 
+def resolve_existing_csv_argument(
+    csv_value: str,
+    instance_root: Path,
+    split_dir: Path,
+    output_root: Path,
+) -> Path:
+    """
+    Resolve a user-provided CSV path robustly.
+
+    This is mainly used for --train-manifest-csv, because hard-mining
+    manifests may be passed either as absolute Windows paths or as paths
+    relative to the current working directory, split directory, instance root,
+    or experiment output root.
+    """
+    raw = str(csv_value).strip().replace("\\", "/")
+
+    if raw == "":
+        fail("Received an empty CSV path argument.")
+
+    p = Path(raw)
+    candidates: List[Path] = [p]
+
+    if not p.is_absolute():
+        candidates.extend(
+            [
+                Path.cwd() / p,
+                split_dir / p,
+                instance_root / p,
+                output_root / p,
+            ]
+        )
+
+    tried: List[str] = []
+    for candidate in candidates:
+        tried.append(path_to_str(candidate))
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    fail(
+        "Could not resolve CSV path argument:\n"
+        f"  input: {raw}\n\n"
+        "Tried:\n"
+        + "\n".join(f"  - {item}" for item in tried)
+    )
+
+def materialize_effective_train_manifest(
+    train_csv_candidate: Path,
+    default_train_csv: Path,
+    run_dir: Path,
+) -> Tuple[Path, Dict[str, Any]]:
+    """
+    Convert a custom hard-mining/curriculum manifest into a dataset-loadable CSV.
+
+    The normal split CSV contains raster-loading columns:
+        optical_path, sar_path, label_path, row_start, col_start
+
+    The hard-mining manifest may contain only diagnostic columns plus dataset_index.
+    In that case, this function uses dataset_index to recover the corresponding
+    rows from the original default train.csv while preserving duplicate sampled rows.
+    """
+
+    required_dataset_columns = [
+        "patch_id",
+        "optical_path",
+        "sar_path",
+        "label_path",
+        "row_start",
+        "col_start",
+        "city",
+        "region",
+    ]
+
+    custom_df = pd.read_csv(train_csv_candidate)
+
+    if custom_df.empty:
+        fail(f"Custom train manifest is empty:\n{path_to_str(train_csv_candidate)}")
+
+    custom_cols = set(custom_df.columns)
+    missing_required = [c for c in required_dataset_columns if c not in custom_cols]
+
+    manifest_info: Dict[str, Any] = {
+        "input_manifest_csv": path_to_str(train_csv_candidate),
+        "default_train_csv": path_to_str(default_train_csv),
+        "input_manifest_rows": int(len(custom_df)),
+        "input_manifest_columns": list(custom_df.columns),
+        "required_dataset_columns": required_dataset_columns,
+        "missing_required_dataset_columns": missing_required,
+    }
+
+    # Case 1: custom manifest is already directly loadable.
+    if not missing_required:
+        manifest_info.update(
+            {
+                "materialization_method": "custom_manifest_already_dataset_loadable",
+                "effective_train_csv": path_to_str(train_csv_candidate),
+                "effective_train_rows": int(len(custom_df)),
+            }
+        )
+        return train_csv_candidate, manifest_info
+
+    # Case 2: recover loading columns from original train.csv using dataset_index.
+    if "dataset_index" not in custom_df.columns:
+        fail(
+            "Custom train manifest is not directly dataset-loadable and does not contain "
+            "`dataset_index`, so it cannot be joined back to the default train.csv.\n\n"
+            f"Custom manifest: {path_to_str(train_csv_candidate)}\n"
+            f"Missing required columns: {missing_required}\n"
+            f"Available columns: {list(custom_df.columns)}"
+        )
+
+    if not default_train_csv.exists():
+        fail(f"Default train CSV does not exist:\n{path_to_str(default_train_csv)}")
+
+    default_df = pd.read_csv(default_train_csv)
+
+    if default_df.empty:
+        fail(f"Default train CSV is empty:\n{path_to_str(default_train_csv)}")
+
+    missing_from_default = [c for c in required_dataset_columns if c not in default_df.columns]
+    if missing_from_default:
+        fail(
+            f"Default train CSV is missing required columns: {missing_from_default}\n"
+            f"Default train CSV: {path_to_str(default_train_csv)}"
+        )
+
+    dataset_indices = pd.to_numeric(custom_df["dataset_index"], errors="coerce")
+
+    if dataset_indices.isna().any():
+        bad_count = int(dataset_indices.isna().sum())
+        fail(
+            f"Custom train manifest has {bad_count} non-numeric dataset_index values:\n"
+            f"{path_to_str(train_csv_candidate)}"
+        )
+
+    dataset_indices = dataset_indices.astype(int)
+
+    min_idx = int(dataset_indices.min())
+    max_idx = int(dataset_indices.max())
+
+    if min_idx < 0 or max_idx >= len(default_df):
+        fail(
+            "dataset_index values are outside the valid range of default train.csv.\n\n"
+            f"Valid range: 0 to {len(default_df) - 1}\n"
+            f"Observed range: {min_idx} to {max_idx}\n"
+            f"Custom manifest: {path_to_str(train_csv_candidate)}\n"
+            f"Default train CSV: {path_to_str(default_train_csv)}"
+        )
+
+    recovered_df = default_df.iloc[dataset_indices.to_numpy()].copy().reset_index(drop=True)
+    custom_reset = custom_df.reset_index(drop=True).copy()
+
+    # Keep all original loading columns from default train.csv.
+    # Add hard-mining/curriculum metadata columns from the custom manifest.
+    metadata_cols_to_add = [
+        c for c in custom_reset.columns
+        if c not in recovered_df.columns or c in {"dataset_index", "sample_pool", "curriculum_recipe", "curriculum_row_id"}
+    ]
+
+    for col in metadata_cols_to_add:
+        new_col = col
+        if new_col in recovered_df.columns:
+            new_col = f"manifest_{col}"
+        recovered_df[new_col] = custom_reset[col].values
+
+    # Add explicit bookkeeping columns.
+    recovered_df["source_dataset_index"] = dataset_indices.to_numpy()
+    recovered_df["source_default_train_csv"] = path_to_str(default_train_csv)
+    recovered_df["source_custom_train_manifest_csv"] = path_to_str(train_csv_candidate)
+
+    # If patch_id exists in both, verify consistency but do not fail too aggressively.
+    if "patch_id" in custom_reset.columns and "patch_id" in default_df.columns:
+        default_patch_ids = default_df.iloc[dataset_indices.to_numpy()]["patch_id"].astype(str).reset_index(drop=True)
+        custom_patch_ids = custom_reset["patch_id"].astype(str).reset_index(drop=True)
+        mismatch_count = int((default_patch_ids != custom_patch_ids).sum())
+
+        manifest_info["patch_id_mismatch_count"] = mismatch_count
+
+        if mismatch_count > 0:
+            warn(
+                f"Found {mismatch_count} patch_id mismatches between custom manifest "
+                "and default train.csv using dataset_index. Continuing because dataset_index "
+                "is still the authoritative mapping, but inspect this if results look strange."
+            )
+    else:
+        manifest_info["patch_id_mismatch_count"] = None
+
+    effective_dir = run_dir / "manifests"
+    ensure_dir(effective_dir)
+
+    effective_csv = effective_dir / "effective_train_manifest.csv"
+    recovered_df.to_csv(effective_csv, index=False)
+
+    manifest_info.update(
+        {
+            "materialization_method": "joined_custom_manifest_to_default_train_csv_by_dataset_index",
+            "effective_train_csv": path_to_str(effective_csv),
+            "effective_train_rows": int(len(recovered_df)),
+            "default_train_rows": int(len(default_df)),
+            "unique_source_dataset_indices": int(dataset_indices.nunique()),
+            "duplicate_rows_due_to_oversampling": int(len(recovered_df) - dataset_indices.nunique()),
+            "metadata_columns_added": metadata_cols_to_add,
+        }
+    )
+
+    return effective_csv, manifest_info
 
 # ---------------------------------------------------------------------
 # Dataset
@@ -1914,9 +2119,28 @@ def run_training(args: argparse.Namespace) -> None:
     split_dir = Path(args.split_dir) if args.split_dir else default_split_dir(instance_root)
     output_root = Path(args.output_root) if args.output_root else default_output_root(instance_root)
 
-    train_csv = split_dir / "train.csv"
+    default_train_csv = split_dir / "train.csv"
     val_csv = split_dir / "val.csv"
     test_csv = split_dir / "test.csv"
+
+    raw_custom_train_manifest_csv: Optional[Path] = None
+    train_manifest_info: Dict[str, Any] = {
+        "enabled": False,
+        "mode": "default_split_train_csv",
+    }
+
+    if args.train_manifest_csv:
+        raw_custom_train_manifest_csv = resolve_existing_csv_argument(
+            csv_value=str(args.train_manifest_csv),
+            instance_root=instance_root,
+            split_dir=split_dir,
+            output_root=output_root,
+        )
+        train_csv = raw_custom_train_manifest_csv
+        train_manifest_mode = "custom_train_manifest_pending_materialization"
+    else:
+        train_csv = default_train_csv
+        train_manifest_mode = "default_split_train_csv"
 
     run_name = args.run_name
     if run_name is None:
@@ -1939,14 +2163,31 @@ def run_training(args: argparse.Namespace) -> None:
     ensure_dir(checkpoints_dir)
     ensure_dir(threshold_dir)
     ensure_dir(figures_dir)
+    
+    if raw_custom_train_manifest_csv is not None:
+        train_csv, train_manifest_info = materialize_effective_train_manifest(
+            train_csv_candidate=raw_custom_train_manifest_csv,
+            default_train_csv=default_train_csv,
+            run_dir=run_dir,
+        )
+        train_manifest_info["enabled"] = True
+        train_manifest_mode = str(train_manifest_info["materialization_method"])
+    else:
+        train_manifest_info = {
+            "enabled": False,
+            "mode": "default_split_train_csv",
+            "effective_train_csv": path_to_str(train_csv),
+        }
 
     banner("Train reBEN ResNet18 S1+S2 + UPerNet for favela segmentation")
 
-    log("INFO", f"Instance root: {path_to_str(instance_root)}")
     log("INFO", f"Split dir:     {path_to_str(split_dir)}")
-    log("INFO", f"Train CSV:     {path_to_str(train_csv)}")
-    log("INFO", f"Val CSV:       {path_to_str(val_csv)}")
-    log("INFO", f"Test CSV:      {path_to_str(test_csv)}")
+    log("INFO", f"Default train CSV:   {path_to_str(default_train_csv)}")
+    log("INFO", f"Effective train CSV: {path_to_str(train_csv)}")
+    log("INFO", f"Train manifest mode: {train_manifest_mode}")
+    log("INFO", f"Train manifest info: {json.dumps(jsonable(train_manifest_info), ensure_ascii=False)[:3000]}")
+    log("INFO", f"Val CSV:             {path_to_str(val_csv)}")
+    log("INFO", f"Test CSV:            {path_to_str(test_csv)}")
     log("INFO", f"Run dir:       {path_to_str(run_dir)}")
     log("INFO", f"Resume:        {path_to_str(resume_checkpoint_path) if resume_checkpoint_path else 'none'}")
 
@@ -1994,11 +2235,27 @@ def run_training(args: argparse.Namespace) -> None:
     log("INFO", f"Val patches:   {len(val_dataset):,}")
     log("INFO", f"Test patches:  {len(test_dataset):,}")
 
-    pos_weight, pos_weight_info = compute_pos_weight_from_csv(
-        train_csv=train_csv,
-        patch_size=int(args.patch_size),
-        max_pos_weight=float(args.max_pos_weight),
-    )
+    if args.fixed_pos_weight is not None:
+        pos_weight = float(args.fixed_pos_weight)
+
+        if not math.isfinite(pos_weight) or pos_weight <= 0:
+            fail(f"--fixed-pos-weight must be a positive finite number, got: {args.fixed_pos_weight}")
+
+        pos_weight_info = {
+            "method": "fixed_from_cli",
+            "reason": "User explicitly provided --fixed-pos-weight.",
+            "train_csv": path_to_str(train_csv),
+            "default_train_csv": path_to_str(default_train_csv),
+            "train_manifest_mode": train_manifest_mode,
+            "pos_weight": float(pos_weight),
+            "max_pos_weight_argument_ignored_for_loss": float(args.max_pos_weight),
+        }
+    else:
+        pos_weight, pos_weight_info = compute_pos_weight_from_csv(
+            train_csv=train_csv,
+            patch_size=int(args.patch_size),
+            max_pos_weight=float(args.max_pos_weight),
+        )
 
     log("INFO", f"Training pos_weight: {pos_weight:.4f}")
     log("INFO", f"pos_weight details: {json.dumps(jsonable(pos_weight_info), ensure_ascii=False)}")
@@ -2098,7 +2355,11 @@ def run_training(args: argparse.Namespace) -> None:
         "args": vars(args),
         "resume_info": resume_info,
         "run_dir": path_to_str(run_dir),
+        "train_manifest_mode": train_manifest_mode,
+        "train_manifest_info": train_manifest_info,
+        "default_train_csv": path_to_str(default_train_csv),
         "train_csv": path_to_str(train_csv),
+        "train_manifest_csv_argument": str(args.train_manifest_csv) if args.train_manifest_csv else None,
         "val_csv": path_to_str(val_csv),
         "test_csv": path_to_str(test_csv),
         "train_patches": len(train_dataset),
@@ -2357,6 +2618,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--run-name", default=None)
     parser.add_argument(
+        "--train-manifest-csv",
+        default=None,
+        help=(
+            "Optional custom CSV used only for the training dataset. "
+            "Validation and test still use val.csv and test.csv from --split-dir. "
+            "Use this for hard-mining/curriculum manifests such as "
+            "train_curriculum_manifest_v2_conservative.csv."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         default=None,
         help=(
@@ -2401,6 +2672,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
 
     parser.add_argument("--max-pos-weight", type=float, default=10.0)
+    parser.add_argument(
+        "--fixed-pos-weight",
+        type=float,
+        default=None,
+        help=(
+            "If provided, use this exact BCE positive-class weight instead of "
+            "computing it from the training CSV. This is useful when the custom "
+            "hard-mining manifest does not contain label_positive_pixels or when "
+            "we want a controlled experiment such as pos_weight=5."
+        ),
+    )
     parser.add_argument("--bce-weight", type=float, default=0.5)
     parser.add_argument("--dice-weight", type=float, default=0.5)
 
