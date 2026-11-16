@@ -1,5 +1,20 @@
 # Brazil Favela S1/S2 Post-processing
 
+Part of my IRD master's research. **[Start with the complete project overview](https://github.com/Mahmoud-AboShukr/favela-dataset-pipeline)** for the research outcome, thesis, and links to optical acquisition, radar acquisition, and label preparation.
+
+## At a glance
+
+**Output:** co-registered Sentinel-1, Sentinel-2, and binary favela masks, followed by patch metadata and geographic evaluation splits. The wider research covered 26 cities and 12,699 patches; the dataset and final TerraMind experiment are not yet released here.
+
+```mermaid
+flowchart LR
+  I["S1 + S2 + refined polygons"] --> A["Alignment and rasterisation"]
+  A --> Q["Coverage and NoData QC"]
+  Q --> P["Patches + metadata + geographic splits"]
+  P --> E["Model experiments and evaluation"]
+```
+
+
 Public post-processing pipeline for preparing Sentinel-1, Sentinel-2, and favela label masks for a deep-learning-ready Brazil favela segmentation dataset.
 
 This repository contains code, configuration files, documentation, and quality-control utilities. It does **not** contain satellite imagery, GeoTIFFs, H5 files, GeoPackages, shapefiles, or other large geospatial data products.
@@ -49,7 +64,7 @@ The input directory is treated as read-only. All post-processed outputs are writ
 │   │   └── selected_scenes_diagnostics.json
 │   └── ...
 ├── s1_images/
-│   ├── rtc_aligned/
+│   ├── raw/
 │   │   ├── brasilia/
 │   │   └── ...
 │   └── ...
@@ -210,12 +225,13 @@ input_root: /media/HALLOPEAU/T7/my_processed_data
 output_root: /media/HALLOPEAU/T7/post_processing_dataset
 
 s2_root: /media/HALLOPEAU/T7/my_processed_data/s2_images
-s1_root: /media/HALLOPEAU/T7/my_processed_data/s1_images/rtc_aligned
+s1_root: /media/HALLOPEAU/T7/my_processed_data/s1_images/raw
 
 final_label_vector: /media/HALLOPEAU/T7/my_processed_data/polygons/final_pipeline_scale_up/brazil_refined_dissolved.gpkg
 original_polygon_vector: /media/HALLOPEAU/T7/my_processed_data/polygons/polygons_clean/favelas_clean.gpkg
 
 keep_all_s2_bands: true
+s1_product_type: GRD
 s1_create_vv_minus_vh: true
 s1_db_mode: auto
 
@@ -254,7 +270,7 @@ python3 src/favela_postprocessing/03_finalize_labels.py --config configs/default
 Or run all first-stage tasks:
 
 ```bash
-./scripts/run_first3_tasks.sh configs/default.yaml
+bash scripts/run_first3_tasks.sh configs/default.yaml
 ```
 
 ---
@@ -313,21 +329,20 @@ small metadata examples
 
 ---
 
-## Current development status
+## Code available beyond the first stage
 
-Current focus:
+The repository now contains additional research scripts. The list below describes source-code availability, not a guarantee that every stage runs without local inputs or path changes.
 
-1. Set up the public GitHub repository.
-2. Clean and validate the first three processing scripts.
-3. Run each script individually.
-4. Inspect QC outputs.
-5. Prepare a report for supervisor discussion.
+| Stage | Source directory |
+| --- | --- |
+| Reflectance standardisation, SNAP processing, QC, geographic splits, tiling, normalisation, U-Net experiments and threshold sweeps | [src/favela_postprocessing](src/favela_postprocessing) |
+| NoData diagnosis, acquisition replacement and stack validation | [src/fixing_nodata](src/fixing_nodata) |
+| RTC processing and georeferencing repairs | [src/rtc_processing](src/rtc_processing) |
+| 224-pixel patch preparation, metadata and spatial cross-validation | [src/instance_C](src/instance_C) |
+| BigEarthNet-based model experiments and geographic diagnostics | [src/big_earth_net](src/big_earth_net) |
+| CROMA probing and embedding experiments | [src/croma_probing](src/croma_probing) |
+| Geographic split experiments | [src/splitting_strategy_experiments](src/splitting_strategy_experiments) |
 
-Future steps:
+Start with inventory and alignment QC before downstream experiments. Edit the machine-specific paths in `configs/default.yaml`; its current default selects GRD inputs. Use settings appropriate to the actual radar product rather than mixing GRD and RTC assumptions.
 
-1. Patch extraction.
-2. H5 export.
-3. Metadata/geolocation CSV.
-4. Geographic train/validation/test split.
-5. Normalization statistics from the training split only.
-6. Final dataset documentation.
+The supplied requirements cover the geospatial preparation workflow. Training scripts need their corresponding model dependencies and a separately checked environment. Large input products, trained weights, and final benchmark outputs are not included. See the [project overview](https://github.com/Mahmoud-AboShukr/favela-dataset-pipeline) for thesis results and release status.
